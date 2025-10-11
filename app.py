@@ -20,15 +20,15 @@ args = Namespace()
 arg_dict = {
     'run_gradio': True, 
     'demo_public': False, 
-    # 'model_name_or_path': 'facebook/opt-125m', 
+     'model_name_or_path': 'facebook/opt-125m', 
     # 'model_name_or_path': 'facebook/opt-1.3b', 
     # 'model_name_or_path': 'facebook/opt-2.7b', 
-    'model_name_or_path': 'facebook/opt-6.7b',
+    # 'model_name_or_path': 'facebook/opt-6.7b',
     # 'model_name_or_path': 'facebook/opt-13b',
     # 'load_fp16' : True,
-    'load_fp16' : False,
+    'load_fp16' : True,
     'prompt_max_length': None, 
-    'max_new_tokens': 200, 
+    'max_new_tokens': 50, 
     'generation_seed': 123, 
     'use_sampling': True, 
     'n_beams': 1, 
@@ -43,6 +43,7 @@ arg_dict = {
     'select_green_tokens': True,
     'skip_model_load': False,
     'seed_separately': True,
+    'default_prompt': "This is the default prompt for generating text."
 }
 
 args.__dict__.update(arg_dict)

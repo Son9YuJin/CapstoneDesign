@@ -16,9 +16,13 @@
 
 import os
 import argparse
+import json
+import csv
 from argparse import Namespace
 from pprint import pprint
+from datasets import load_dataset 
 from functools import partial
+import pandas as pd
 
 import numpy # for gradio hot reload
 import gradio as gr
@@ -606,7 +610,7 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         select_green_tokens.change(fn=detect_partial, inputs=[detection_input,session_args], outputs=[detection_result,session_args])
 
 
-    demo.queue(concurrency_count=3)
+    demo.queue()
 
     if args.demo_public:
         demo.launch(share=True) # exposes app to the internet via randomly generated link
@@ -614,82 +618,137 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         demo.launch()
 
 def main(args): 
-    """Run a command line version of the generation and detection operations
-        and optionally launch and serve the gradio demo"""
+    """Run the generation and detection operations
+    to collect experimental data using a Hugging Face dataset, and save 
+    watermarked and non-watermarked results to separate CSV files.
+    Optionally launches gradio demo."""
+    
     # Initial arg processing and log
     args.normalizers = (args.normalizers.split(",") if args.normalizers else [])
     print(args)
 
     if not args.skip_model_load:
-        model, tokenizer, device = load_model(args)
+        model, tokenizer, device = load_model(args) 
     else:
         model, tokenizer, device = None, None, None
 
-    # Generate and detect, report to stdout
-    if not args.skip_model_load:
-        input_text = (
-        "The diamondback terrapin or simply terrapin (Malaclemys terrapin) is a "
-        "species of turtle native to the brackish coastal tidal marshes of the "
-        "Northeastern and southern United States, and in Bermuda.[6] It belongs "
-        "to the monotypic genus Malaclemys. It has one of the largest ranges of "
-        "all turtles in North America, stretching as far south as the Florida Keys "
-        "and as far north as Cape Cod.[7] The name 'terrapin' is derived from the "
-        "Algonquian word torope.[8] It applies to Malaclemys terrapin in both "
-        "British English and American English. The name originally was used by "
-        "early European settlers in North America to describe these brackish-water "
-        "turtles that inhabited neither freshwater habitats nor the sea. It retains "
-        "this primary meaning in American English.[8] In British English, however, "
-        "other semi-aquatic turtle species, such as the red-eared slider, might "
-        "also be called terrapins. The common name refers to the diamond pattern "
-        "on top of its shell (carapace), but the overall pattern and coloration "
-        "vary greatly. The shell is usually wider at the back than in the front, "
-        "and from above it appears wedge-shaped. The shell coloring can vary "
-        "from brown to grey, and its body color can be grey, brown, yellow, "
-        "or white. All have a unique pattern of wiggly, black markings or spots "
-        "on their body and head. The diamondback terrapin has large webbed "
-        "feet.[9] The species is"
-        )
+    # --- 데이터 수집 모드 시작: Hugging Face Dataset 사용 ---
+    
+    # 1. Hugging Face 데이터셋 설정 (예시: 'imdb' 데이터셋의 훈련 데이터)
+    DATASET_NAME = 'imdb'
+    DATASET_SPLIT = 'train'
+    TEXT_COLUMN = 'text' # 프롬프트로 사용할 컬럼 이름
+    MAX_PROMPTS = 100 # 테스트를 위해 최대 100개만 사용하도록 제한
+    
+    # 출력 파일명 설정: 요청에 따라 두 개의 파일로 분리
+    output_filename_no_wm = "experiment_data_no_wm.csv"
+    output_filename_wm = "experiment_data_wm.csv"
+    
+    prompts = []
+    
+    try:
+        print(f"Loading Hugging Face dataset: {DATASET_NAME} ({DATASET_SPLIT})...")
 
-        args.default_prompt = input_text
+        # 데이터셋 로드
+        dataset = load_dataset(DATASET_NAME, split=DATASET_SPLIT)
+        
+        # 프롬프트 추출 및 제한
+        prompts = dataset[TEXT_COLUMN][:MAX_PROMPTS]
+        prompts = [p.strip() for p in prompts if p.strip()]
 
-        term_width = 80
-        print("#"*term_width)
-        print("Prompt:")
-        print(input_text)
+        if prompts and not args.skip_model_load:
+            print(f"Loaded {len(prompts)} prompts from {DATASET_NAME}. Starting data generation...")
+            
+            # CSV 파일 헤더 정의 (두 파일 모두 동일한 구조)
+            fieldnames = ["id", "original_prompt", "generated_text", "p_value", "z_score"]
 
-        _, _, decoded_output_without_watermark, decoded_output_with_watermark, _ = generate(input_text, 
-                                                                                            args, 
-                                                                                            model=model, 
-                                                                                            device=device, 
-                                                                                            tokenizer=tokenizer)
-        without_watermark_detection_result = detect(decoded_output_without_watermark, 
-                                                    args, 
-                                                    device=device, 
-                                                    tokenizer=tokenizer)
-        with_watermark_detection_result = detect(decoded_output_with_watermark, 
-                                                 args, 
-                                                 device=device, 
-                                                 tokenizer=tokenizer)
+            # CSV 파일 두 개를 동시에 엽니다.
+            with open(output_filename_no_wm, 'w', newline='', encoding='utf-8') as csvfile_no_wm, \
+                 open(output_filename_wm, 'w', newline='', encoding='utf-8') as csvfile_wm:
+                
+                writer_no_wm = csv.DictWriter(csvfile_no_wm, fieldnames=fieldnames)
+                writer_wm = csv.DictWriter(csvfile_wm, fieldnames=fieldnames)
+                
+                writer_no_wm.writeheader()
+                writer_wm.writeheader()
 
-        print("#"*term_width)
-        print("Output without watermark:")
-        print(decoded_output_without_watermark)
-        print("-"*term_width)
-        print(f"Detection result @ {args.detection_z_threshold}:")
-        pprint(without_watermark_detection_result)
-        print("-"*term_width)
+                for i, input_text in enumerate(prompts):
+                    if not input_text.strip():
+                        continue
 
-        print("#"*term_width)
-        print("Output with watermark:")
-        print(decoded_output_with_watermark)
-        print("-"*term_width)
-        print(f"Detection result @ {args.detection_z_threshold}:")
-        pprint(with_watermark_detection_result)
-        print("-"*term_width)
+                    print(f"[{i+1}/{len(prompts)}] Processing prompt...")
 
+                    # 워터마크 없는 텍스트 생성 및 탐지
+                    _, _, decoded_output_without_watermark, _, _ = generate(input_text, 
+                                                                           args, 
+                                                                           model=model, 
+                                                                           device=device, 
+                                                                           tokenizer=tokenizer,
+                                                                           is_watermarked=False) 
 
-    # Launch the app to generate and detect interactively (implements the hf space demo)
+                    without_watermark_detection_result = detect(decoded_output_without_watermark, args, device=device, tokenizer=tokenizer)
+                    
+                    no_wm_p_value, no_wm_z_score = "N/A", "N/A"
+                    try:
+                        no_wm_p_value = without_watermark_detection_result.get('p_value', "N/A")
+                        no_wm_z_score = without_watermark_detection_result.get('z_score', "N/A")
+                    except Exception:
+                        pass
+                    
+                    # No-WM 결과 파일에 작성
+                    row_no_wm = {
+                        "id": i,
+                        "original_prompt": input_text,
+                        "generated_text": decoded_output_without_watermark.strip(),
+                        "p_value": no_wm_p_value,
+                        "z_score": no_wm_z_score,
+                    }
+                    writer_no_wm.writerow(row_no_wm)
+
+                    # 워터마크 있는 텍스트 생성 및 탐지
+                    _, _, _, decoded_output_with_watermark, _ = generate(input_text, 
+                                                                        args, 
+                                                                        model=model, 
+                                                                        device=device, 
+                                                                        tokenizer=tokenizer,
+                                                                        is_watermarked=True) 
+
+                    with_watermark_detection_result = detect(decoded_output_with_watermark, args, device=device, tokenizer=tokenizer)
+                    
+                    wm_p_value, wm_z_score = "N/A", "N/A"
+                    try:
+                        wm_p_value = with_watermark_detection_result.get('p_value', "N/A")
+                        wm_z_score = with_watermark_detection_result.get('z_score', "N/A")
+                    except Exception:
+                        pass
+
+                    # WM 결과 파일에 작성
+                    row_wm = {
+                        "id": i,
+                        "original_prompt": input_text,
+                        "generated_text": decoded_output_with_watermark.strip(),
+                        "p_value": wm_p_value,
+                        "z_score": wm_z_score,
+                    }
+                    writer_wm.writerow(row_wm)
+
+                    print(f"   -> WM Z-score: {wm_z_score}, No WM Z-score: {no_wm_z_score}")
+                    print("-" * 50)
+            
+            print(f"\n--- Data generation complete. Saved {len(prompts)} rows to {output_filename_no_wm} and {output_filename_wm} ---")
+            
+        elif args.skip_model_load:
+             print("Skipping generation: Model loading was skipped.")
+        else:
+            print(f"No valid prompts found in {DATASET_NAME}.")
+
+    except Exception as e:
+        print(f"Error during data collection: {e}")
+        
+    # --- Gradio 데모 실행 부분 ---
     if args.run_gradio:
+        print("\nLaunching Gradio demo...")
+
         run_gradio(args, model=model, tokenizer=tokenizer, device=device)
 
     return
