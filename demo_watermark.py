@@ -36,6 +36,40 @@ from transformers import (AutoTokenizer,
 
 from watermark_processor import WatermarkLogitsProcessor, WatermarkDetector
 
+def _normalize_detection_result(res, z_threshold=None):
+    """
+    detection 결과가 dict/tuple/list 어떤 형태로 와도
+    {'is_detected','p_value','z_score'} 형태의 dict로 바꿔준다.
+    """
+    out = {'is_detected': 'N/A', 'p_value': 'N/A', 'z_score': 'N/A'}
+
+    if isinstance(res, dict):
+        out['p_value'] = res.get('p_value', res.get('p', 'N/A'))
+        out['z_score'] = res.get('z_score', res.get('z', 'N/A'))
+        out['is_detected'] = res.get('is_detected', res.get('detected', 'N/A'))
+        return out
+
+    if isinstance(res, (tuple, list)):
+        # p_value 후보: 0~1 사이의 수
+        for x in res:
+            if isinstance(x, (int, float)) and 0.0 <= float(x) <= 1.0:
+                out['p_value'] = float(x); break
+        # z_score 후보: 실수들 중 0~1 제외한 첫 값
+        nums = [float(x) for x in res if isinstance(x, (int, float))]
+        z_alts = [z for z in nums if not (0.0 <= z <= 1.0)]
+        if z_alts:
+            out['z_score'] = z_alts[0]
+        # is_detected 후보: bool 있으면 사용, 없으면 z_threshold로 판정
+        bools = [b for b in res if isinstance(b, bool)]
+        if bools:
+            out['is_detected'] = bools[0]
+        elif z_threshold is not None and isinstance(out['z_score'], (int, float)):
+            out['is_detected'] = abs(float(out['z_score'])) >= float(z_threshold)
+        return out
+
+    return out
+
+
 def str2bool(v):
     """Util function for user friendly boolean flag args"""
     if isinstance(v, bool):
@@ -77,10 +111,18 @@ def parse_args():
         help="Truncation length for prompt, overrides model config's max length field.",
     )
     parser.add_argument(
+        # 출력 토큰 수
         "--max_new_tokens",
         type=int,
-        default=200,
+        default=50,
         help="Maximmum number of new tokens to generate.",
+    )
+    parser.add_argument(
+        # 프롬프트 토큰 수
+        "--input_prompt_tokens",
+        type=int,
+        default=200,
+        help="Number of tokens from the beginning of the prompt to use as model input.",
     )
     parser.add_argument(
         "--generation_seed",
@@ -204,74 +246,62 @@ def load_model(args):
 
     return model, tokenizer, device
 
-def generate(prompt, args, model=None, device=None, tokenizer=None):
-    """Instatiate the WatermarkLogitsProcessor according to the watermark parameters
-       and generate watermarked text by passing it to the generate method of the model
-       as a logits processor. """
-    
-    print(f"Generating with {args}")
+def generate(prompt, args, model=None, device=None, tokenizer=None, is_watermarked=False):
+    """
+    텍스트를 생성하는 함수.
+    워터마크 적용 여부(is_watermarked)에 따라 LogitsProcessor를 다르게 설정합니다.
+    max_length가 비정상적으로 큰 값(예: 1e30 등)이 들어오는 경우를 방지하기 위해
+    안전한 최대 길이를 계산하도록 수정했습니다.
+    """
 
-    watermark_processor = WatermarkLogitsProcessor(vocab=list(tokenizer.get_vocab().values()),
-                                                    gamma=args.gamma,
-                                                    delta=args.delta,
-                                                    seeding_scheme=args.seeding_scheme,
-                                                    select_green_tokens=args.select_green_tokens)
+    # --- 워터마크 설정 ---
+    if is_watermarked:
+        watermark_processor = WatermarkLogitsProcessor(
+            vocab=list(tokenizer.get_vocab().values()),
+            gamma=args.gamma,
+            delta=args.delta,
+            seeding_scheme=args.seeding_scheme,
+            select_green_tokens=args.select_green_tokens
+        )
+        logits_processor = LogitsProcessorList([watermark_processor])
+    else:
+        logits_processor = None
 
+    # --- 생성 파라미터 설정 ---
     gen_kwargs = dict(max_new_tokens=args.max_new_tokens)
-
     if args.use_sampling:
-        gen_kwargs.update(dict(
-            do_sample=True, 
-            top_k=0,
-            temperature=args.sampling_temp
-        ))
+        gen_kwargs.update(dict(do_sample=True, top_k=0, temperature=args.sampling_temp))
     else:
-        gen_kwargs.update(dict(
-            num_beams=args.n_beams
-        ))
+        gen_kwargs.update(dict(num_beams=args.n_beams))
 
-    generate_without_watermark = partial(
-        model.generate,
-        **gen_kwargs
+    enc = tokenizer(
+        prompt,
+        return_tensors="pt",
+        add_special_tokens=True,
+        truncation=False
     )
-    generate_with_watermark = partial(
-        model.generate,
-        logits_processor=LogitsProcessorList([watermark_processor]), 
-        **gen_kwargs
-    )
-    if args.prompt_max_length:
-        pass
-    elif hasattr(model.config,"max_position_embedding"):
-        args.prompt_max_length = model.config.max_position_embeddings-args.max_new_tokens
-    else:
-        args.prompt_max_length = 2048-args.max_new_tokens
 
-    tokd_input = tokenizer(prompt, return_tensors="pt", add_special_tokens=True, truncation=True, max_length=args.prompt_max_length).to(device)
-    truncation_warning = True if tokd_input["input_ids"].shape[-1] == args.prompt_max_length else False
-    redecoded_input = tokenizer.batch_decode(tokd_input["input_ids"], skip_special_tokens=True)[0]
+    # input_ids에서 앞 200 토큰만 사용
+    input_ids = enc["input_ids"][0][:200]
+    # 길이에 맞는 attention mask (앞에서부터 연속 토큰이므로 전부 1)
+    attention_mask = torch.ones_like(input_ids)
 
+    # 배치 차원 추가 + 디바이스 이동
+    tokd_input = {
+        "input_ids": input_ids.unsqueeze(0).to(device),
+        "attention_mask": attention_mask.unsqueeze(0).to(device)
+    }
+
+    # 시드 고정(옵션)
     torch.manual_seed(args.generation_seed)
-    output_without_watermark = generate_without_watermark(**tokd_input)
 
-    # optional to seed before second generation, but will not be the same again generally, unless delta==0.0, no-op watermark
-    if args.seed_separately: 
-        torch.manual_seed(args.generation_seed)
-    output_with_watermark = generate_with_watermark(**tokd_input)
+    # --- 생성 ---
+    output = model.generate(**tokd_input, logits_processor=logits_processor, **gen_kwargs)
+    decoded_output = tokenizer.batch_decode(output, skip_special_tokens=True)[0]
 
-    if args.is_decoder_only_model:
-        # need to isolate the newly generated tokens
-        output_without_watermark = output_without_watermark[:,tokd_input["input_ids"].shape[-1]:]
-        output_with_watermark = output_with_watermark[:,tokd_input["input_ids"].shape[-1]:]
+    return decoded_output
 
-    decoded_output_without_watermark = tokenizer.batch_decode(output_without_watermark, skip_special_tokens=True)[0]
-    decoded_output_with_watermark = tokenizer.batch_decode(output_with_watermark, skip_special_tokens=True)[0]
 
-    return (redecoded_input,
-            int(truncation_warning),
-            decoded_output_without_watermark, 
-            decoded_output_with_watermark,
-            args) 
-            # decoded_output_with_watermark)
 
 def format_names(s):
     """Format names for the gradio demo interface"""
@@ -327,9 +357,50 @@ def detect(input_text, args, device=None, tokenizer=None):
         output += [["",""] for _ in range(6)]
     return output, args
 
+def detect_raw(input_text, args, device=None, tokenizer=None):
+    """
+    CSV 저장/로직 처리를 위한 '점수 dict'를 반환하는 감지 함수.
+    UI용 detect()는 (표 렌더 데이터, args) 튜플을 반환하므로,
+    코드 로직에서는 이 함수를 써서 p_value, z_score 등을 안정적으로 가져오세요.
+    """
+    watermark_detector = WatermarkDetector(
+        vocab=list(tokenizer.get_vocab().values()),
+        gamma=args.gamma,
+        seeding_scheme=args.seeding_scheme,
+        device=device,
+        tokenizer=tokenizer,
+        z_threshold=args.detection_z_threshold,
+        normalizers=args.normalizers,
+        ignore_repeated_bigrams=args.ignore_repeated_bigrams,
+        select_green_tokens=args.select_green_tokens
+    )
+
+    if len(input_text) - 1 > watermark_detector.min_prefix_len:
+        score_dict = watermark_detector.detect(input_text)  # <-- dict
+        return score_dict  # keys: num_tokens_scored, num_green_tokens, green_fraction, z_score, p_value, prediction, confidence ...
+    else:
+        # 너무 짧으면 빈 dict
+        return {}
+    
+def generate_ui(prompt, args, model=None, device=None, tokenizer=None):
+    # UI에서는 재디코딩/트렁케이션 경고를 간단히 처리
+    redecoded_input = prompt
+    truncation_warning = 0  # 또는 False
+
+    # 기본/워터마크 출력 각각 생성
+    out_no_wm = generate(
+        prompt, args, model=model, device=device, tokenizer=tokenizer, is_watermarked=False
+    )
+    out_wm = generate(
+        prompt, args, model=model, device=device, tokenizer=tokenizer, is_watermarked=True
+    )
+
+    return redecoded_input, truncation_warning, out_no_wm, out_wm, args
+
+
 def run_gradio(args, model=None, device=None, tokenizer=None):
     """Define and launch the gradio demo interface"""
-    generate_partial = partial(generate, model=model, device=device, tokenizer=tokenizer)
+    generate_ui_partial = partial(generate_ui, model=model, device=device, tokenizer=tokenizer)
     detect_partial = partial(detect, device=device, tokenizer=tokenizer)
 
     with gr.Blocks() as demo:
@@ -529,7 +600,7 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                 """)
         
         # Register main generation tab click, outputing generations as well as a the encoded+redecoded+potentially truncated prompt and flag
-        generate_btn.click(fn=generate_partial, inputs=[prompt,session_args], outputs=[redecoded_input, truncation_warning, output_without_watermark, output_with_watermark,session_args])
+        generate_btn.click(fn=generate_ui_partial, inputs=[prompt,session_args], outputs=[redecoded_input, truncation_warning, output_without_watermark, output_with_watermark,session_args])
         # Show truncated version of prompt if truncation occurred
         redecoded_input.change(fn=truncate_prompt, inputs=[redecoded_input,truncation_warning,prompt,session_args], outputs=[prompt,session_args])
         # Call detection when the outputs (of the generate function) are updated
@@ -619,7 +690,7 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
 
 def main(args): 
     """Run the generation and detection operations
-    to collect experimental data using a Hugging Face dataset, and save 
+    to collect experimental data using a local CSV file, and save 
     watermarked and non-watermarked results to separate CSV files.
     Optionally launches gradio demo."""
     
@@ -632,123 +703,122 @@ def main(args):
     else:
         model, tokenizer, device = None, None, None
 
-    # --- 데이터 수집 모드 시작: Hugging Face Dataset 사용 ---
+    # --- 데이터 수집 모드 시작: 로컬 CSV 파일 사용 ---
     
-    # 1. Hugging Face 데이터셋 설정 (예시: 'imdb' 데이터셋의 훈련 데이터)
-    DATASET_NAME = 'imdb'
-    DATASET_SPLIT = 'train'
-    TEXT_COLUMN = 'text' # 프롬프트로 사용할 컬럼 이름
-    MAX_PROMPTS = 100 # 테스트를 위해 최대 100개만 사용하도록 제한
+    # 1. 로컬 CSV 파일 설정
+    INPUT_CSV_FILENAME = "human_prompts.csv"
+    PROMPT_COLUMN = 'data'    # 프롬프트가 포함된 CSV 컬럼 이름 (필요에 따라 변경)
+    MAX_PROMPTS = 100         # 테스트를 위해 최대 100개만 사용하도록 제한
     
-    # 출력 파일명 설정: 요청에 따라 두 개의 파일로 분리
+    # 출력 파일명 설정
     output_filename_no_wm = "experiment_data_no_wm.csv"
     output_filename_wm = "experiment_data_wm.csv"
     
     prompts = []
     
     try:
-        print(f"Loading Hugging Face dataset: {DATASET_NAME} ({DATASET_SPLIT})...")
-
-        # 데이터셋 로드
-        dataset = load_dataset(DATASET_NAME, split=DATASET_SPLIT)
+        print(f"Loading prompts from local CSV file: {INPUT_CSV_FILENAME}...")
+        with open(INPUT_CSV_FILENAME, mode='r', encoding='utf-8') as infile:
+            reader = csv.DictReader(infile)
+            for row in reader:
+                # PROMPT_COLUMN이 있고, 그 값이 비어있지 않은 경우에만 추가
+                if PROMPT_COLUMN in row and row[PROMPT_COLUMN].strip():
+                    prompts.append(row[PROMPT_COLUMN].strip())
+                if len(prompts) >= MAX_PROMPTS:
+                    print(f"Reached max prompts limit of {MAX_PROMPTS}.")
+                    break
         
-        # 프롬프트 추출 및 제한
-        prompts = dataset[TEXT_COLUMN][:MAX_PROMPTS]
-        prompts = [p.strip() for p in prompts if p.strip()]
+        if not prompts:
+             print(f"No valid prompts found in '{INPUT_CSV_FILENAME}' in column '{PROMPT_COLUMN}'.")
 
-        if prompts and not args.skip_model_load:
-            print(f"Loaded {len(prompts)} prompts from {DATASET_NAME}. Starting data generation...")
-            
-            # CSV 파일 헤더 정의 (두 파일 모두 동일한 구조)
-            fieldnames = ["id", "original_prompt", "generated_text", "p_value", "z_score"]
-
-            # CSV 파일 두 개를 동시에 엽니다.
-            with open(output_filename_no_wm, 'w', newline='', encoding='utf-8') as csvfile_no_wm, \
-                 open(output_filename_wm, 'w', newline='', encoding='utf-8') as csvfile_wm:
-                
-                writer_no_wm = csv.DictWriter(csvfile_no_wm, fieldnames=fieldnames)
-                writer_wm = csv.DictWriter(csvfile_wm, fieldnames=fieldnames)
-                
-                writer_no_wm.writeheader()
-                writer_wm.writeheader()
-
-                for i, input_text in enumerate(prompts):
-                    if not input_text.strip():
-                        continue
-
-                    print(f"[{i+1}/{len(prompts)}] Processing prompt...")
-
-                    # 워터마크 없는 텍스트 생성 및 탐지
-                    _, _, decoded_output_without_watermark, _, _ = generate(input_text, 
-                                                                           args, 
-                                                                           model=model, 
-                                                                           device=device, 
-                                                                           tokenizer=tokenizer,
-                                                                           is_watermarked=False) 
-
-                    without_watermark_detection_result = detect(decoded_output_without_watermark, args, device=device, tokenizer=tokenizer)
-                    
-                    no_wm_p_value, no_wm_z_score = "N/A", "N/A"
-                    try:
-                        no_wm_p_value = without_watermark_detection_result.get('p_value', "N/A")
-                        no_wm_z_score = without_watermark_detection_result.get('z_score', "N/A")
-                    except Exception:
-                        pass
-                    
-                    # No-WM 결과 파일에 작성
-                    row_no_wm = {
-                        "id": i,
-                        "original_prompt": input_text,
-                        "generated_text": decoded_output_without_watermark.strip(),
-                        "p_value": no_wm_p_value,
-                        "z_score": no_wm_z_score,
-                    }
-                    writer_no_wm.writerow(row_no_wm)
-
-                    # 워터마크 있는 텍스트 생성 및 탐지
-                    _, _, _, decoded_output_with_watermark, _ = generate(input_text, 
-                                                                        args, 
-                                                                        model=model, 
-                                                                        device=device, 
-                                                                        tokenizer=tokenizer,
-                                                                        is_watermarked=True) 
-
-                    with_watermark_detection_result = detect(decoded_output_with_watermark, args, device=device, tokenizer=tokenizer)
-                    
-                    wm_p_value, wm_z_score = "N/A", "N/A"
-                    try:
-                        wm_p_value = with_watermark_detection_result.get('p_value', "N/A")
-                        wm_z_score = with_watermark_detection_result.get('z_score', "N/A")
-                    except Exception:
-                        pass
-
-                    # WM 결과 파일에 작성
-                    row_wm = {
-                        "id": i,
-                        "original_prompt": input_text,
-                        "generated_text": decoded_output_with_watermark.strip(),
-                        "p_value": wm_p_value,
-                        "z_score": wm_z_score,
-                    }
-                    writer_wm.writerow(row_wm)
-
-                    print(f"   -> WM Z-score: {wm_z_score}, No WM Z-score: {no_wm_z_score}")
-                    print("-" * 50)
-            
-            print(f"\n--- Data generation complete. Saved {len(prompts)} rows to {output_filename_no_wm} and {output_filename_wm} ---")
-            
-        elif args.skip_model_load:
-             print("Skipping generation: Model loading was skipped.")
-        else:
-            print(f"No valid prompts found in {DATASET_NAME}.")
-
+    except FileNotFoundError:
+        print(f"Error: The file '{INPUT_CSV_FILENAME}' was not found.")
+        prompts = [] # 파일이 없으면 프롬프트 리스트를 비움
     except Exception as e:
-        print(f"Error during data collection: {e}")
+        print(f"An error occurred while reading the CSV file: {e}")
+        prompts = []
+
+    # 프롬프트가 성공적으로 로드된 경우에만 생성 및 탐지 작업 수행
+    if prompts and not args.skip_model_load:
+        print(f"Loaded {len(prompts)} prompts from '{INPUT_CSV_FILENAME}'. Starting data generation...")
+        
+        # CSV 파일 헤더 정의
+        fieldnames = ["id", "original_prompt", "generated_text", "p_value", "z_score"]
+
+        # CSV 파일 두 개를 동시에 엽니다.
+        with open(output_filename_no_wm, 'w', newline='', encoding='utf-8') as csvfile_no_wm, \
+             open(output_filename_wm, 'w', newline='', encoding='utf-8') as csvfile_wm:
+            
+            writer_no_wm = csv.DictWriter(csvfile_no_wm, fieldnames=fieldnames)
+            writer_wm = csv.DictWriter(csvfile_wm, fieldnames=fieldnames)
+            
+            writer_no_wm.writeheader()
+            writer_wm.writeheader()
+
+            for i, input_text in enumerate(prompts):
+                print(f"[{i+1}/{len(prompts)}] Processing prompt...")
+
+                # 워터마크 없는 텍스트 생성 및 탐지
+                decoded_output_without_watermark= generate(input_text, 
+                                                                         args, 
+                                                                         model=model, 
+                                                                         device=device, 
+                                                                         tokenizer=tokenizer,
+                                                                         is_watermarked=False) 
+
+                score_no_wm = detect_raw(decoded_output_without_watermark, args, device=device, tokenizer=tokenizer)
+
+                no_wm_p_value = score_no_wm.get('p_value', "N/A")
+                no_wm_z_score = score_no_wm.get('z_score', "N/A")
+
+                
+                # No-WM 결과 파일에 작성
+                row_no_wm = {
+                    "id": i,
+                    "original_prompt": input_text,
+                    "generated_text": decoded_output_without_watermark.strip(),
+                    "p_value": no_wm_p_value,
+                    "z_score": no_wm_z_score,
+                }
+                writer_no_wm.writerow(row_no_wm)
+
+                # 워터마크 있는 텍스트 생성 및 탐지
+                decoded_output_with_watermark = generate(
+                    input_text,
+                    args,
+                    model=model,
+                    device=device,
+                    tokenizer=tokenizer,
+                    is_watermarked=True
+                )
+
+                score_wm = detect_raw(decoded_output_with_watermark, args, device=device, tokenizer=tokenizer)
+
+                wm_p_value = score_wm.get('p_value', "N/A")
+                wm_z_score = score_wm.get('z_score', "N/A")
+
+
+                # WM 결과 파일에 작성
+                row_wm = {
+                    "id": i,
+                    "original_prompt": input_text,
+                    "generated_text": decoded_output_with_watermark.strip(),
+                    "p_value": wm_p_value,
+                    "z_score": wm_z_score,
+                }
+                writer_wm.writerow(row_wm)
+
+                print(f"  -> WM Z-score: {wm_z_score}, No WM Z-score: {no_wm_z_score}")
+                print("-" * 50)
+            
+        print(f"\n--- Data generation complete. Saved {len(prompts)} rows to {output_filename_no_wm} and {output_filename_wm} ---")
+        
+    elif args.skip_model_load:
+        print("Skipping generation: Model loading was skipped.")
         
     # --- Gradio 데모 실행 부분 ---
     if args.run_gradio:
         print("\nLaunching Gradio demo...")
-
         run_gradio(args, model=model, tokenizer=tokenizer, device=device)
 
     return
