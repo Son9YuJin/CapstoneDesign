@@ -667,9 +667,9 @@ def main(args):
         with open(output_filename_no_wm, 'w', newline='', encoding='utf-8') as csvfile_no_wm, \
              open(output_filename_wm, 'w', newline='', encoding='utf-8') as csvfile_wm:
             
-            writer_no_wm = csv.DictWriter(csvfile_no_wm, fieldnames=fieldnames)
-            writer_wm = csv.DictWriter(csvfile_wm, fieldnames=fieldnames)
-            
+            writer_no_wm = csv.DictWriter(csvfile_no_wm, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+            writer_wm = csv.DictWriter(csvfile_wm, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+
             writer_no_wm.writeheader()
             writer_wm.writeheader()
 
