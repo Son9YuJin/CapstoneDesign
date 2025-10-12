@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+
 import os
 import argparse
 import json
@@ -24,7 +25,7 @@ from datasets import load_dataset
 from functools import partial
 import pandas as pd
 
-import numpy # for gradio hot reload
+import numpy  # for gradio hot reload
 import gradio as gr
 
 import torch
@@ -37,10 +38,6 @@ from transformers import (AutoTokenizer,
 from watermark_processor import WatermarkLogitsProcessor, WatermarkDetector
 
 def _normalize_detection_result(res, z_threshold=None):
-    """
-    detection 결과가 dict/tuple/list 어떤 형태로 와도
-    {'is_detected','p_value','z_score'} 형태의 dict로 바꿔준다.
-    """
     out = {'is_detected': 'N/A', 'p_value': 'N/A', 'z_score': 'N/A'}
 
     if isinstance(res, dict):
@@ -50,16 +47,13 @@ def _normalize_detection_result(res, z_threshold=None):
         return out
 
     if isinstance(res, (tuple, list)):
-        # p_value 후보: 0~1 사이의 수
         for x in res:
             if isinstance(x, (int, float)) and 0.0 <= float(x) <= 1.0:
                 out['p_value'] = float(x); break
-        # z_score 후보: 실수들 중 0~1 제외한 첫 값
         nums = [float(x) for x in res if isinstance(x, (int, float))]
         z_alts = [z for z in nums if not (0.0 <= z <= 1.0)]
         if z_alts:
             out['z_score'] = z_alts[0]
-        # is_detected 후보: bool 있으면 사용, 없으면 z_threshold로 판정
         bools = [b for b in res if isinstance(b, bool)]
         if bools:
             out['is_detected'] = bools[0]
@@ -99,9 +93,20 @@ def parse_args():
         help="Whether to expose the gradio demo to the internet.",
     )
     parser.add_argument(
+    "--max_prompts",
+    type=int,
+    default=100,
+    help="Maximum number of prompts to process from the CSV file."
+    )
+    parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="facebook/opt-6.7b",
+        default="facebook/opt-125m",
+        # 'model_name_or_path': 'facebook/opt-125m', 
+        # 'model_name_or_path': 'facebook/opt-1.3b', 
+        # 'model_name_or_path': 'facebook/opt-2.7b', 
+        # 'model_name_or_path': 'facebook/opt-6.7b',
+        # 'model_name_or_path': 'facebook/opt-13b',
         help="Main model, path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -111,14 +116,12 @@ def parse_args():
         help="Truncation length for prompt, overrides model config's max length field.",
     )
     parser.add_argument(
-        # 출력 토큰 수
         "--max_new_tokens",
         type=int,
-        default=50,
-        help="Maximmum number of new tokens to generate.",
+        default=200,
+        help="Maximum number of new tokens to generate.",
     )
     parser.add_argument(
-        # 프롬프트 토큰 수
         "--input_prompt_tokens",
         type=int,
         default=200,
@@ -214,11 +217,16 @@ def parse_args():
         default=False,
         help="Whether to run model in float16 precsion.",
     )
+    parser.add_argument(
+        "--default_prompt",
+        type=str,
+        default="This is the default prompt for generating text.",
+        help="Default prompt shown in the Gradio UI.",
+    )
     args = parser.parse_args()
     return args
 
 def load_model(args):
-    """Load and return the model and tokenizer"""
 
     args.is_seq2seq_model = any([(model_type in args.model_name_or_path) for model_type in ["t5","T0"]])
     args.is_decoder_only_model = any([(model_type in args.model_name_or_path) for model_type in ["gpt","opt","bloom"]])
@@ -226,7 +234,7 @@ def load_model(args):
         model = AutoModelForSeq2SeqLM.from_pretrained(args.model_name_or_path)
     elif args.is_decoder_only_model:
         if args.load_fp16:
-            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path,torch_dtype=torch.float16, device_map='auto')
+            model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, torch_dtype=torch.float16, device_map='auto')
         else:
             model = AutoModelForCausalLM.from_pretrained(args.model_name_or_path)
     else:
@@ -246,15 +254,7 @@ def load_model(args):
 
     return model, tokenizer, device
 
-def generate(prompt, args, model=None, device=None, tokenizer=None, is_watermarked=False):
-    """
-    텍스트를 생성하는 함수.
-    워터마크 적용 여부(is_watermarked)에 따라 LogitsProcessor를 다르게 설정합니다.
-    max_length가 비정상적으로 큰 값(예: 1e30 등)이 들어오는 경우를 방지하기 위해
-    안전한 최대 길이를 계산하도록 수정했습니다.
-    """
-
-    # --- 워터마크 설정 ---
+def generate(prompt, args, model=None, device=None, tokenizer=None, is_watermarked=False, return_truncated=False):
     if is_watermarked:
         watermark_processor = WatermarkLogitsProcessor(
             vocab=list(tokenizer.get_vocab().values()),
@@ -267,8 +267,11 @@ def generate(prompt, args, model=None, device=None, tokenizer=None, is_watermark
     else:
         logits_processor = None
 
-    # --- 생성 파라미터 설정 ---
-    gen_kwargs = dict(max_new_tokens=args.max_new_tokens)
+    gen_kwargs = dict(
+        max_new_tokens=args.max_new_tokens,
+        return_dict_in_generate=True,
+        output_scores=False
+    )
     if args.use_sampling:
         gen_kwargs.update(dict(do_sample=True, top_k=0, temperature=args.sampling_temp))
     else:
@@ -281,26 +284,35 @@ def generate(prompt, args, model=None, device=None, tokenizer=None, is_watermark
         truncation=False
     )
 
-    # input_ids에서 앞 200 토큰만 사용
-    input_ids = enc["input_ids"][0][:200]
-    # 길이에 맞는 attention mask (앞에서부터 연속 토큰이므로 전부 1)
+    prompt_len = int(getattr(args, "input_prompt_tokens", 200))
+    all_ids = enc["input_ids"][0]
+    input_ids = all_ids[:prompt_len]  
+
     attention_mask = torch.ones_like(input_ids)
 
-    # 배치 차원 추가 + 디바이스 이동
     tokd_input = {
         "input_ids": input_ids.unsqueeze(0).to(device),
         "attention_mask": attention_mask.unsqueeze(0).to(device)
     }
 
-    # 시드 고정(옵션)
     torch.manual_seed(args.generation_seed)
 
-    # --- 생성 ---
-    output = model.generate(**tokd_input, logits_processor=logits_processor, **gen_kwargs)
-    decoded_output = tokenizer.batch_decode(output, skip_special_tokens=True)[0]
+    out = model.generate(**tokd_input, logits_processor=logits_processor, **gen_kwargs)
 
-    return decoded_output
+    sequences = out.sequences
+    input_len = tokd_input["input_ids"].shape[1]
+    gen_only_ids = sequences[:, input_len:]
 
+    used_prompt_text = tokenizer.decode(tokd_input["input_ids"][0], skip_special_tokens=True)
+    generated_text = tokenizer.decode(gen_only_ids[0], skip_special_tokens=True)
+
+    generated_text = " ".join(generated_text.split())
+    used_prompt_text = " ".join(used_prompt_text.split())
+
+    if return_truncated:
+        return generated_text, used_prompt_text
+    else:
+        return generated_text
 
 
 def format_names(s):
@@ -317,7 +329,6 @@ def format_names(s):
 def list_format_scores(score_dict, detection_threshold):
     """Format the detection metrics into a gradio dataframe input format"""
     lst_2d = []
-    # lst_2d.append(["z-score threshold", f"{detection_threshold}"])
     for k,v in score_dict.items():
         if k=='green_fraction': 
             lst_2d.append([format_names(k), f"{v:.1%}"])
@@ -336,8 +347,6 @@ def list_format_scores(score_dict, detection_threshold):
     return lst_2d
 
 def detect(input_text, args, device=None, tokenizer=None):
-    """Instantiate the WatermarkDetection object and call detect on
-        the input text returning the scores and outcome of the test"""
     watermark_detector = WatermarkDetector(vocab=list(tokenizer.get_vocab().values()),
                                         gamma=args.gamma,
                                         seeding_scheme=args.seeding_scheme,
@@ -349,20 +358,13 @@ def detect(input_text, args, device=None, tokenizer=None):
                                         select_green_tokens=args.select_green_tokens)
     if len(input_text)-1 > watermark_detector.min_prefix_len:
         score_dict = watermark_detector.detect(input_text)
-        # output = str_format_scores(score_dict, watermark_detector.z_threshold)
         output = list_format_scores(score_dict, watermark_detector.z_threshold)
     else:
-        # output = (f"Error: string not long enough to compute watermark presence.")
         output = [["Error","string too short to compute metrics"]]
         output += [["",""] for _ in range(6)]
     return output, args
 
 def detect_raw(input_text, args, device=None, tokenizer=None):
-    """
-    CSV 저장/로직 처리를 위한 '점수 dict'를 반환하는 감지 함수.
-    UI용 detect()는 (표 렌더 데이터, args) 튜플을 반환하므로,
-    코드 로직에서는 이 함수를 써서 p_value, z_score 등을 안정적으로 가져오세요.
-    """
     watermark_detector = WatermarkDetector(
         vocab=list(tokenizer.get_vocab().values()),
         gamma=args.gamma,
@@ -375,19 +377,34 @@ def detect_raw(input_text, args, device=None, tokenizer=None):
         select_green_tokens=args.select_green_tokens
     )
 
-    if len(input_text) - 1 > watermark_detector.min_prefix_len:
-        score_dict = watermark_detector.detect(input_text)  # <-- dict
-        return score_dict  # keys: num_tokens_scored, num_green_tokens, green_fraction, z_score, p_value, prediction, confidence ...
-    else:
-        # 너무 짧으면 빈 dict
+    try:
+        enc = tokenizer(
+            input_text,
+            return_tensors=None,
+            add_special_tokens=True,
+            truncation=False
+        )
+        ids = enc["input_ids"]
+        if isinstance(ids[0], list):
+            ids = ids[0]
+        num_tokens = len(ids)
+    except Exception:
+        return {}
+
+    need_after_prefix = 1
+    if num_tokens - watermark_detector.min_prefix_len < need_after_prefix:
+        return {}
+
+    try:
+        score_dict = watermark_detector.detect(input_text)
+        return score_dict
+    except ValueError:
         return {}
     
 def generate_ui(prompt, args, model=None, device=None, tokenizer=None):
-    # UI에서는 재디코딩/트렁케이션 경고를 간단히 처리
     redecoded_input = prompt
-    truncation_warning = 0  # 또는 False
+    truncation_warning = 0 
 
-    # 기본/워터마크 출력 각각 생성
     out_no_wm = generate(
         prompt, args, model=model, device=device, tokenizer=tokenizer, is_watermarked=False
     )
@@ -399,12 +416,10 @@ def generate_ui(prompt, args, model=None, device=None, tokenizer=None):
 
 
 def run_gradio(args, model=None, device=None, tokenizer=None):
-    """Define and launch the gradio demo interface"""
     generate_ui_partial = partial(generate_ui, model=model, device=device, tokenizer=tokenizer)
     detect_partial = partial(detect, device=device, tokenizer=tokenizer)
 
     with gr.Blocks() as demo:
-        # Top section, greeting and instructions
         with gr.Row():
             with gr.Column(scale=9):
                 gr.Markdown(
@@ -418,50 +433,34 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                 [![](https://badgen.net/badge/icon/GitHub?icon=github&label)](https://github.com/jwkirchenbauer/lm-watermarking)
                 """
                 )
-            # with gr.Column(scale=2):
-            #     pass
-            # ![visitor badge](https://visitor-badge.glitch.me/badge?page_id=tomg-group-umd_lm-watermarking) # buggy
 
         with gr.Accordion("Understanding the output metrics",open=False):
             gr.Markdown(
             """
             - `z-score threshold` : The cuttoff for the hypothesis test
             - `Tokens Counted (T)` : The number of tokens in the output that were counted by the detection algorithm. 
-                The first token is ommitted in the simple, single token seeding scheme since there is no way to generate
-                a greenlist for it as it has no prefix token(s). Under the "Ignore Bigram Repeats" detection algorithm, 
-                described in the bottom panel, this can be much less than the total number of tokens generated if there is a lot of repetition.
             - `# Tokens in Greenlist` : The number of tokens that were observed to fall in their respective greenlist
-            - `Fraction of T in Greenlist` : The `# Tokens in Greenlist` / `T`. This is expected to be approximately `gamma` for human/unwatermarked text.
-            - `z-score` : The test statistic for the detection hypothesis test. If larger than the `z-score threshold` 
-                we "reject the null hypothesis" that the text is human/unwatermarked, and conclude it is watermarked
-            - `p value` : The likelihood of observing the computed `z-score` under the null hypothesis. This is the likelihood of 
-                observing the `Fraction of T in Greenlist` given that the text was generated without knowledge of the watermark procedure/greenlists.
-                If this is extremely _small_ we are confident that this many green tokens was not chosen by random chance.
-            -  `prediction` : The outcome of the hypothesis test - whether the observed `z-score` was higher than the `z-score threshold`
-            - `confidence` : If we reject the null hypothesis, and the `prediction` is "Watermarked", then we report 1-`p value` to represent 
-                the confidence of the detection based on the unlikeliness of this `z-score` observation.
+            - `Fraction of T in Greenlist` : The `# Tokens in Greenlist` / `T`.
+            - `z-score` : The test statistic for the detection hypothesis test.
+            - `p value` : Likelihood of observing the computed `z-score` under the null hypothesis.
+            -  `prediction` : Whether the observed `z-score` was higher than the threshold.
+            - `confidence` : If "Watermarked", we report 1-`p value`.
             """
             )
 
         with gr.Accordion("A note on model capability",open=True):
             gr.Markdown(
                 """
-                This demo uses open-source language models that fit on a single GPU. These models are less powerful than proprietary commercial tools like ChatGPT, Claude, or Bard. 
-
-                Importantly, we use a language model that is designed to "complete" your prompt, and not a model this is fine-tuned to follow instructions. 
-                For best results, prompt the model with a few sentences that form the beginning of a paragraph, and then allow it to "continue" your paragraph. 
-                Some examples include the opening paragraph of a wikipedia article, or the first few sentences of a story. 
-                Longer prompts that end mid-sentence will result in more fluent generations.
+                This demo uses open-source language models that fit on a single GPU.
                 """
                 )
         gr.Markdown(f"Language model: {args.model_name_or_path} {'(float16 mode)' if args.load_fp16 else ''}")
 
         # Construct state for parameters, define updates and toggles
-        default_prompt = args.__dict__.pop("default_prompt")
+        default_prompt = getattr(args, "default_prompt", "This is the default prompt for generating text.")
         session_args = gr.State(value=args)
 
         with gr.Tab("Generate and Detect"):
-            
             with gr.Row():
                 prompt = gr.Textbox(label=f"Prompt", interactive=True,lines=10,max_lines=10, value=default_prompt)
             with gr.Row():
@@ -470,13 +469,11 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                 with gr.Column(scale=2):
                     output_without_watermark = gr.Textbox(label="Output Without Watermark", interactive=False,lines=14,max_lines=14)
                 with gr.Column(scale=1):
-                    # without_watermark_detection_result = gr.Textbox(label="Detection Result", interactive=False,lines=14,max_lines=14)
                     without_watermark_detection_result = gr.Dataframe(headers=["Metric", "Value"], interactive=False,row_count=7,col_count=2)
             with gr.Row():
                 with gr.Column(scale=2):
                     output_with_watermark = gr.Textbox(label="Output With Watermark", interactive=False,lines=14,max_lines=14)
                 with gr.Column(scale=1):
-                    # with_watermark_detection_result = gr.Textbox(label="Detection Result", interactive=False,lines=14,max_lines=14)
                     with_watermark_detection_result = gr.Dataframe(headers=["Metric", "Value"],interactive=False,row_count=7,col_count=2)
 
             redecoded_input = gr.Textbox(visible=False)
@@ -492,7 +489,6 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                 with gr.Column(scale=2):
                     detection_input = gr.Textbox(label="Text to Analyze", interactive=True,lines=14,max_lines=14)
                 with gr.Column(scale=1):
-                    # detection_result = gr.Textbox(label="Detection Result", interactive=False,lines=14,max_lines=14)
                     detection_result = gr.Dataframe(headers=["Metric", "Value"], interactive=False,row_count=7,col_count=2)
             with gr.Row():
                     detect_btn = gr.Button("Detect")
@@ -526,7 +522,7 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                         ignore_repeated_bigrams = gr.Checkbox(label="Ignore Bigram Repeats")
                     with gr.Row():
                         normalizers = gr.CheckboxGroup(label="Normalizations", choices=["unicode", "homoglyphs", "truecase"], value=args.normalizers)
-            # with gr.Accordion("Actual submitted parameters:",open=False):
+
             with gr.Row():
                 gr.Markdown(f"_Note: sliders don't always update perfectly. Clicking on the bar or using the number window to the right can help. Window below shows the current settings._")
             with gr.Row():
@@ -537,80 +533,8 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                         seed_separately = gr.Checkbox(label="Seed both generations separately", value=args.seed_separately)
                     with gr.Column(scale=1):
                         select_green_tokens = gr.Checkbox(label="Select 'greenlist' from partition", value=args.select_green_tokens)
-        
-        with gr.Accordion("Understanding the settings",open=False):
-            gr.Markdown(
-            """
-            #### Generation Parameters:
 
-            - Decoding Method : We can generate tokens from the model using either multinomial sampling or we can generate using greedy decoding.
-            - Sampling Temperature : If using multinomial sampling we can set the temperature of the sampling distribution. 
-                                0.0 is equivalent to greedy decoding, and 1.0 is the maximum amount of variability/entropy in the next token distribution.
-                                0.7 strikes a nice balance between faithfulness to the model's estimate of top candidates while adding variety. Does not apply for greedy decoding.
-            - Generation Seed : The integer to pass to the torch random number generator before running generation. Makes the multinomial sampling strategy
-                                outputs reproducible. Does not apply for greedy decoding.
-            - Number of Beams : When using greedy decoding, we can also set the number of beams to > 1 to enable beam search. 
-                                This is not implemented/excluded from paper for multinomial sampling but may be added in future.
-            - Max Generated Tokens : The `max_new_tokens` parameter passed to the generation method to stop the output at a certain number of new tokens. 
-                                    Note that the model is free to generate fewer tokens depending on the prompt. 
-                                    Implicitly this sets the maximum number of prompt tokens possible as the model's maximum input length minus `max_new_tokens`,
-                                    and inputs will be truncated accordingly.
-            
-            #### Watermark Parameters:
-
-            - gamma : The fraction of the vocabulary to be partitioned into the greenlist at each generation step. 
-                     Smaller gamma values create a stronger watermark by enabling the watermarked model to achieve 
-                     a greater differentiation from human/unwatermarked text because it is preferentially sampling 
-                     from a smaller green set making those tokens less likely to occur by chance.
-            - delta : The amount of positive bias to add to the logits of every token in the greenlist 
-                        at each generation step before sampling/choosing the next token. Higher delta values 
-                        mean that the greenlist tokens are more heavily preferred by the watermarked model
-                        and as the bias becomes very large the watermark transitions from "soft" to "hard". 
-                        For a hard watermark, nearly all tokens are green, but this can have a detrimental effect on
-                        generation quality, especially when there is not a lot of flexibility in the distribution.
-
-            #### Detector Parameters:
-            
-            - z-score threshold : the z-score cuttoff for the hypothesis test. Higher thresholds (such as 4.0) make
-                                _false positives_ (predicting that human/unwatermarked text is watermarked) very unlikely
-                                as a genuine human text with a significant number of tokens will almost never achieve 
-                                that high of a z-score. Lower thresholds will capture more _true positives_ as some watermarked
-                                texts will contain less green tokens and achive a lower z-score, but still pass the lower bar and 
-                                be flagged as "watermarked". However, a lowere threshold will increase the chance that human text 
-                                that contains a slightly higher than average number of green tokens is erroneously flagged. 
-                                4.0-5.0 offers extremely low false positive rates while still accurately catching most watermarked text.
-            - Ignore Bigram Repeats : This alternate detection algorithm only considers the unique bigrams in the text during detection, 
-                                    computing the greenlists based on the first in each pair and checking whether the second falls within the list.
-                                    This means that `T` is now the unique number of bigrams in the text, which becomes less than the total
-                                    number of tokens generated if the text contains a lot of repetition. See the paper for a more detailed discussion.
-            - Normalizations : we implement a few basic normaliations to defend against various adversarial perturbations of the
-                                text analyzed during detection. Currently we support converting all chracters to unicode, 
-                                replacing homoglyphs with a canonical form, and standardizing the capitalization. 
-                                See the paper for a detailed discussion of input normalization. 
-            """
-            )
-        
-        gr.HTML("""
-                <p>For faster inference without waiting in queue, you may duplicate the space and upgrade to GPU in settings. 
-                    Follow the github link at the top and host the demo on your own GPU hardware to test out larger models.
-                <br/>
-                <a href="https://huggingface.co/spaces/tomg-group-umd/lm-watermarking?duplicate=true">
-                <img style="margin-top: 0em; margin-bottom: 0em" src="https://bit.ly/3gLdBN6" alt="Duplicate Space"></a>
-                <p/>
-                """)
-        
-        # Register main generation tab click, outputing generations as well as a the encoded+redecoded+potentially truncated prompt and flag
-        generate_btn.click(fn=generate_ui_partial, inputs=[prompt,session_args], outputs=[redecoded_input, truncation_warning, output_without_watermark, output_with_watermark,session_args])
-        # Show truncated version of prompt if truncation occurred
-        redecoded_input.change(fn=truncate_prompt, inputs=[redecoded_input,truncation_warning,prompt,session_args], outputs=[prompt,session_args])
-        # Call detection when the outputs (of the generate function) are updated
-        output_without_watermark.change(fn=detect_partial, inputs=[output_without_watermark,session_args], outputs=[without_watermark_detection_result,session_args])
-        output_with_watermark.change(fn=detect_partial, inputs=[output_with_watermark,session_args], outputs=[with_watermark_detection_result,session_args])
-        # Register main detection tab click
-        detect_btn.click(fn=detect_partial, inputs=[detection_input,session_args], outputs=[detection_result, session_args])
-
-        # State management logic
-        # update callbacks that change the state dict
+        # callbacks
         def update_sampling_temp(session_state, value): session_state.sampling_temp = float(value); return session_state
         def update_generation_seed(session_state, value): session_state.generation_seed = int(value); return session_state
         def update_gamma(session_state, value): session_state.gamma = float(value); return session_state
@@ -638,11 +562,12 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         def update_normalizers(session_state, value): session_state.normalizers = value; return session_state
         def update_seed_separately(session_state, value): session_state.seed_separately = value; return session_state
         def update_select_green_tokens(session_state, value): session_state.select_green_tokens = value; return session_state
-        # registering callbacks for toggling the visibilty of certain parameters
+
+        # register events
         decoding.change(toggle_sampling_vis,inputs=[decoding], outputs=[sampling_temp])
         decoding.change(toggle_sampling_vis,inputs=[decoding], outputs=[generation_seed])
         decoding.change(toggle_sampling_vis_inv,inputs=[decoding], outputs=[n_beams])
-        # registering all state update callbacks
+
         decoding.change(update_decoding,inputs=[session_args, decoding], outputs=[session_args])
         sampling_temp.change(update_sampling_temp,inputs=[session_args, sampling_temp], outputs=[session_args])
         generation_seed.change(update_generation_seed,inputs=[session_args, generation_seed], outputs=[session_args])
@@ -655,10 +580,17 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         normalizers.change(update_normalizers,inputs=[session_args, normalizers], outputs=[session_args])
         seed_separately.change(update_seed_separately,inputs=[session_args, seed_separately], outputs=[session_args])
         select_green_tokens.change(update_select_green_tokens,inputs=[session_args, select_green_tokens], outputs=[session_args])
-        # register additional callback on button clicks that updates the shown parameters window
+
+        generate_btn.click(fn=generate_ui_partial, inputs=[prompt,session_args], outputs=[redecoded_input, truncation_warning, output_without_watermark, output_with_watermark,session_args])
+        redecoded_input.change(fn=truncate_prompt, inputs=[redecoded_input,truncation_warning,prompt,session_args], outputs=[prompt,session_args])
+        output_without_watermark.change(fn=detect_partial, inputs=[output_without_watermark,session_args], outputs=[without_watermark_detection_result,session_args])
+        output_with_watermark.change(fn=detect_partial, inputs=[output_with_watermark,session_args], outputs=[with_watermark_detection_result,session_args])
+
+        detect_btn.click(fn=detect_partial, inputs=[detection_input,session_args], outputs=[detection_result, session_args])
+
         generate_btn.click(lambda value: str(value), inputs=[session_args], outputs=[current_parameters])
         detect_btn.click(lambda value: str(value), inputs=[session_args], outputs=[current_parameters])
-        # When the parameters change, display the update and fire detection, since some detection params dont change the model output.
+
         gamma.change(lambda value: str(value), inputs=[session_args], outputs=[current_parameters])
         gamma.change(fn=detect_partial, inputs=[output_without_watermark,session_args], outputs=[without_watermark_detection_result,session_args])
         gamma.change(fn=detect_partial, inputs=[output_with_watermark,session_args], outputs=[with_watermark_detection_result,session_args])
@@ -680,21 +612,14 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         select_green_tokens.change(fn=detect_partial, inputs=[output_with_watermark,session_args], outputs=[with_watermark_detection_result,session_args])
         select_green_tokens.change(fn=detect_partial, inputs=[detection_input,session_args], outputs=[detection_result,session_args])
 
-
     demo.queue()
 
     if args.demo_public:
-        demo.launch(share=True) # exposes app to the internet via randomly generated link
+        demo.launch(share=True)
     else:
         demo.launch()
 
 def main(args): 
-    """Run the generation and detection operations
-    to collect experimental data using a local CSV file, and save 
-    watermarked and non-watermarked results to separate CSV files.
-    Optionally launches gradio demo."""
-    
-    # Initial arg processing and log
     args.normalizers = (args.normalizers.split(",") if args.normalizers else [])
     print(args)
 
@@ -703,25 +628,21 @@ def main(args):
     else:
         model, tokenizer, device = None, None, None
 
-    # --- 데이터 수집 모드 시작: 로컬 CSV 파일 사용 ---
+    DATA_DIR = "dataset"
+    INPUT_CSV_FILENAME = os.path.join(DATA_DIR, "human_prompts.csv")
+    PROMPT_COLUMN = 'data'
+    MAX_PROMPTS = getattr(args, "max_prompts", 100)
     
-    # 1. 로컬 CSV 파일 설정
-    INPUT_CSV_FILENAME = "human_prompts.csv"
-    PROMPT_COLUMN = 'data'    # 프롬프트가 포함된 CSV 컬럼 이름 (필요에 따라 변경)
-    MAX_PROMPTS = 100         # 테스트를 위해 최대 100개만 사용하도록 제한
-    
-    # 출력 파일명 설정
-    output_filename_no_wm = "experiment_data_no_wm.csv"
-    output_filename_wm = "experiment_data_wm.csv"
+    output_filename_no_wm = os.path.join(DATA_DIR, "experiment_data_no_wm.csv")
+    output_filename_wm = os.path.join(DATA_DIR, "experiment_data_wm.csv")
     
     prompts = []
     
     try:
         print(f"Loading prompts from local CSV file: {INPUT_CSV_FILENAME}...")
-        with open(INPUT_CSV_FILENAME, mode='r', encoding='utf-8') as infile:
+        with open(INPUT_CSV_FILENAME, mode='r', encoding='utf-8', errors='replace') as infile:
             reader = csv.DictReader(infile)
             for row in reader:
-                # PROMPT_COLUMN이 있고, 그 값이 비어있지 않은 경우에만 추가
                 if PROMPT_COLUMN in row and row[PROMPT_COLUMN].strip():
                     prompts.append(row[PROMPT_COLUMN].strip())
                 if len(prompts) >= MAX_PROMPTS:
@@ -733,19 +654,16 @@ def main(args):
 
     except FileNotFoundError:
         print(f"Error: The file '{INPUT_CSV_FILENAME}' was not found.")
-        prompts = [] # 파일이 없으면 프롬프트 리스트를 비움
+        prompts = []
     except Exception as e:
         print(f"An error occurred while reading the CSV file: {e}")
         prompts = []
 
-    # 프롬프트가 성공적으로 로드된 경우에만 생성 및 탐지 작업 수행
     if prompts and not args.skip_model_load:
         print(f"Loaded {len(prompts)} prompts from '{INPUT_CSV_FILENAME}'. Starting data generation...")
         
-        # CSV 파일 헤더 정의
-        fieldnames = ["id", "original_prompt", "generated_text", "p_value", "z_score"]
+        fieldnames = ["id", "original_prompt", "used_prompt", "generated_text", "p_value", "z_score"]
 
-        # CSV 파일 두 개를 동시에 엽니다.
         with open(output_filename_no_wm, 'w', newline='', encoding='utf-8') as csvfile_no_wm, \
              open(output_filename_wm, 'w', newline='', encoding='utf-8') as csvfile_wm:
             
@@ -758,50 +676,46 @@ def main(args):
             for i, input_text in enumerate(prompts):
                 print(f"[{i+1}/{len(prompts)}] Processing prompt...")
 
-                # 워터마크 없는 텍스트 생성 및 탐지
-                decoded_output_without_watermark= generate(input_text, 
-                                                                         args, 
-                                                                         model=model, 
-                                                                         device=device, 
-                                                                         tokenizer=tokenizer,
-                                                                         is_watermarked=False) 
-
+                decoded_output_without_watermark, used_prompt_text = generate(
+                    input_text, 
+                    args, 
+                    model=model, 
+                    device=device, 
+                    tokenizer=tokenizer,
+                    is_watermarked=False,
+                    return_truncated=True
+                )
                 score_no_wm = detect_raw(decoded_output_without_watermark, args, device=device, tokenizer=tokenizer)
-
                 no_wm_p_value = score_no_wm.get('p_value', "N/A")
                 no_wm_z_score = score_no_wm.get('z_score', "N/A")
 
-                
-                # No-WM 결과 파일에 작성
                 row_no_wm = {
                     "id": i,
                     "original_prompt": input_text,
+                    "used_prompt": used_prompt_text,   
                     "generated_text": decoded_output_without_watermark.strip(),
                     "p_value": no_wm_p_value,
                     "z_score": no_wm_z_score,
                 }
                 writer_no_wm.writerow(row_no_wm)
 
-                # 워터마크 있는 텍스트 생성 및 탐지
-                decoded_output_with_watermark = generate(
+                decoded_output_with_watermark, used_prompt_text_wm = generate(
                     input_text,
                     args,
                     model=model,
                     device=device,
                     tokenizer=tokenizer,
-                    is_watermarked=True
+                    is_watermarked=True,
+                    return_truncated=True
                 )
-
                 score_wm = detect_raw(decoded_output_with_watermark, args, device=device, tokenizer=tokenizer)
-
                 wm_p_value = score_wm.get('p_value', "N/A")
                 wm_z_score = score_wm.get('z_score', "N/A")
 
-
-                # WM 결과 파일에 작성
                 row_wm = {
                     "id": i,
                     "original_prompt": input_text,
+                    "used_prompt": used_prompt_text_wm, 
                     "generated_text": decoded_output_with_watermark.strip(),
                     "p_value": wm_p_value,
                     "z_score": wm_z_score,
@@ -816,7 +730,6 @@ def main(args):
     elif args.skip_model_load:
         print("Skipping generation: Model loading was skipped.")
         
-    # --- Gradio 데모 실행 부분 ---
     if args.run_gradio:
         print("\nLaunching Gradio demo...")
         run_gradio(args, model=model, tokenizer=tokenizer, device=device)
