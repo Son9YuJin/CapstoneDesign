@@ -24,8 +24,10 @@ from pprint import pprint
 from datasets import load_dataset 
 from functools import partial
 import pandas as pd
+import re
+import unicodedata
 
-import numpy  # for gradio hot reload
+import numpy  
 import gradio as gr
 
 import torch
@@ -95,7 +97,7 @@ def parse_args():
     parser.add_argument(
     "--max_prompts",
     type=int,
-    default=100,
+    default=None,
     help="Maximum number of prompts to process from the CSV file."
     )
     parser.add_argument(
@@ -619,6 +621,18 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
     else:
         demo.launch()
 
+def clean_text(text: str) -> str:
+    if not text:
+        return ""
+    text = text.replace("&quot;", "\"").replace("&apos;", "'")
+    text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\x00-\x1F\x7F-\x9F]", " ", text)
+    text = re.sub(r"[^\u0000-\uD7FF\uE000-\uFFFF]", "", text)
+    text = re.sub(r"[^가-힣a-zA-Z0-9\s.,!?;:'\"()\-\[\]/]", " ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 def main(args): 
     args.normalizers = (args.normalizers.split(",") if args.normalizers else [])
     print(args)
@@ -637,21 +651,26 @@ def main(args):
     output_filename_wm = os.path.join(DATA_DIR, "experiment_data_wm.csv")
     
     prompts = []
-    
+
     try:
         print(f"Loading prompts from local CSV file: {INPUT_CSV_FILENAME}...")
-        with open(INPUT_CSV_FILENAME, mode='r', encoding='utf-8', errors='replace') as infile:
-            reader = csv.DictReader(infile)
+        with open(INPUT_CSV_FILENAME, mode='r', encoding='utf-8', errors='replace', newline='') as infile:
+            reader = csv.reader(infile)
+            header = next(reader, None)  
             for row in reader:
-                if PROMPT_COLUMN in row and row[PROMPT_COLUMN].strip():
-                    prompts.append(row[PROMPT_COLUMN].strip())
-                if len(prompts) >= MAX_PROMPTS:
-                    print(f"Reached max prompts limit of {MAX_PROMPTS}.")
+                if not row:
+                    continue
+                if len(row) >= 2:
+                    text = ",".join(row[1:]).strip()   
+                    text = clean_text(text)            
+                    if text:
+                        prompts.append(text)
+                if args.max_prompts is not None and len(prompts) >= args.max_prompts:
+                    print(f"Reached max prompts limit of {args.max_prompts}.")
                     break
-        
-        if not prompts:
-             print(f"No valid prompts found in '{INPUT_CSV_FILENAME}' in column '{PROMPT_COLUMN}'.")
 
+        if not prompts:
+            print(f"No valid prompts found in '{INPUT_CSV_FILENAME}' after parsing.")
     except FileNotFoundError:
         print(f"Error: The file '{INPUT_CSV_FILENAME}' was not found.")
         prompts = []
@@ -659,13 +678,20 @@ def main(args):
         print(f"An error occurred while reading the CSV file: {e}")
         prompts = []
 
+
+
     if prompts and not args.skip_model_load:
         print(f"Loaded {len(prompts)} prompts from '{INPUT_CSV_FILENAME}'. Starting data generation...")
         
-        fieldnames = ["id", "original_prompt", "used_prompt", "generated_text", "p_value", "z_score"]
+        fieldnames = [
+            "id", "original_prompt", "used_prompt",
+            "generated_text_raw", "generated_text_clean",
+            "p_value", "z_score"  
+        ]
 
-        with open(output_filename_no_wm, 'w', newline='', encoding='utf-8') as csvfile_no_wm, \
-             open(output_filename_wm, 'w', newline='', encoding='utf-8') as csvfile_wm:
+        with open(output_filename_no_wm, 'w', newline='', encoding='utf-8-sig') as csvfile_no_wm, \
+             open(output_filename_wm, 'w', newline='', encoding='utf-8-sig') as csvfile_wm:
+
             
             writer_no_wm = csv.DictWriter(csvfile_no_wm, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
             writer_wm = csv.DictWriter(csvfile_wm, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
@@ -677,46 +703,44 @@ def main(args):
                 print(f"[{i+1}/{len(prompts)}] Processing prompt...")
 
                 decoded_output_without_watermark, used_prompt_text = generate(
-                    input_text, 
-                    args, 
-                    model=model, 
-                    device=device, 
-                    tokenizer=tokenizer,
-                    is_watermarked=False,
-                    return_truncated=True
+                    input_text, args, model=model, device=device, tokenizer=tokenizer,
+                    is_watermarked=False, return_truncated=True
                 )
+                
                 score_no_wm = detect_raw(decoded_output_without_watermark, args, device=device, tokenizer=tokenizer)
                 no_wm_p_value = score_no_wm.get('p_value', "N/A")
                 no_wm_z_score = score_no_wm.get('z_score', "N/A")
 
+                clean_no_wm = clean_text(decoded_output_without_watermark)
+
                 row_no_wm = {
                     "id": i,
                     "original_prompt": input_text,
-                    "used_prompt": used_prompt_text,   
-                    "generated_text": decoded_output_without_watermark.strip(),
+                    "used_prompt": used_prompt_text,
+                    "generated_text_raw": decoded_output_without_watermark.strip(),
+                    "generated_text_clean": clean_no_wm,
                     "p_value": no_wm_p_value,
                     "z_score": no_wm_z_score,
                 }
                 writer_no_wm.writerow(row_no_wm)
 
                 decoded_output_with_watermark, used_prompt_text_wm = generate(
-                    input_text,
-                    args,
-                    model=model,
-                    device=device,
-                    tokenizer=tokenizer,
-                    is_watermarked=True,
-                    return_truncated=True
+                    input_text, args, model=model, device=device, tokenizer=tokenizer,
+                    is_watermarked=True, return_truncated=True
                 )
+                
                 score_wm = detect_raw(decoded_output_with_watermark, args, device=device, tokenizer=tokenizer)
                 wm_p_value = score_wm.get('p_value', "N/A")
                 wm_z_score = score_wm.get('z_score', "N/A")
 
+                clean_wm = clean_text(decoded_output_with_watermark)
+
                 row_wm = {
                     "id": i,
                     "original_prompt": input_text,
-                    "used_prompt": used_prompt_text_wm, 
-                    "generated_text": decoded_output_with_watermark.strip(),
+                    "used_prompt": used_prompt_text_wm,
+                    "generated_text_raw": decoded_output_with_watermark.strip(),
+                    "generated_text_clean": clean_wm,
                     "p_value": wm_p_value,
                     "z_score": wm_z_score,
                 }
