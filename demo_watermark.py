@@ -22,8 +22,8 @@ from watermark_processor import WatermarkLogitsProcessor, WatermarkDetector
 # ========================== CONFIG ==========================
 INPUT_CSV = "dataset/human_prompts.csv"
 OUTPUT_CSV = "dataset/clustering_wm.csv"
-MODEL_NAME = "facebook/opt-6.7b"  
-USE_GPU = False
+MODEL_NAME = "facebook/opt-350m"  
+USE_GPU = True
 MAX_NEW_TOKENS = 100
 CLUSTER_DATA_PATH = "cluster_data.npz"
 NUM_PROMPT_TOKENS = 200
@@ -41,7 +41,10 @@ def clean_generated_text(text: str) -> str:
         return ""
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
-    return text.strip()
+    text = text.strip()
+    text = re.sub(r"[^a-zA-Z0-9.,!?;:'\"()\[\]{}%$@#&*/\-\s]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()   
 
 def build_used_prompt(original_prompt: str, tokenizer, n_tokens: int) -> str:
     """Take first N tokens and decode back to text."""
@@ -155,6 +158,8 @@ def main():
     prompt_col = "data" if "data" in df.columns else df.columns[0]
 
     outputs = []
+
+
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing"):
         original = str(row[prompt_col]) if not pd.isna(row[prompt_col]) else ""
         if not original.strip():
