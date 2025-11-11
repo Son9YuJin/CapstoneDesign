@@ -1,6 +1,5 @@
 # coding=utf-8
 # Copyright 2023 Authors of "A Watermark for Large Language Models"
-# Modified 2025 by Song YuJin for automatic batch processing (no Gradio)
 
 import os
 import re
@@ -22,29 +21,51 @@ from watermark_processor import WatermarkLogitsProcessor, WatermarkDetector
 # ========================== CONFIG ==========================
 INPUT_CSV = "dataset/human_prompts.csv"
 OUTPUT_CSV = "dataset/clustering_wm.csv"
-MODEL_NAME = "facebook/opt-350m"  
+MODEL_NAME = "facebook/opt-125m"
 USE_GPU = True
 MAX_NEW_TOKENS = 100
 CLUSTER_DATA_PATH = "cluster_data.npz"
-NUM_PROMPT_TOKENS = 200
+NUM_PROMPT_TOKENS = 100
 # ============================================================
 
 def preprocess_for_model(text: str) -> str:
     """Preprocessing before truncation or feeding into model."""
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text)
+    text = re.sub(r"[가-힣ㄱ-ㅎㅏ-ㅣ]", "", text)
+    text = re.sub(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF\uA960-\uA97F\uD7B0-\uD7FF]", "", text)
+    text = re.sub(r"[^\x00-\x7F]+", "", text)
     return text.strip()
 
 def clean_generated_text(text: str) -> str:
-    """Postprocess model output."""
     if text is None:
         return ""
+
+    # 공백 정리
     text = text.replace("\r", " ").replace("\n", " ")
-    text = re.sub(r"\s+", " ", text)
-    text = text.strip()
-    text = re.sub(r"[^a-zA-Z0-9.,!?;:'\"()\[\]{}%$@#&*/\-\s]", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()   
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # 완전한 비ASCII 문자 제거 
+    text = re.sub(r"[^\x00-\x7F]+", "", text)
+
+    # 한글 및 자모 제거
+    text = re.sub(r"[가-힣ㄱ-ㅎㅏ-ㅣ]", "", text)
+    text = re.sub(r"[\u1100-\u11FF\u3130-\u318F\uAC00-\uD7AF\uA960-\uA97F\uD7B0-\uD7FF]", "", text)
+
+    # 긴 구분선/반복 기호를 ' — '로 축약 (---, - - - -, ***, ___, === 등)
+    text = re.sub(r"(?:[-*_=]\s*){3,}", " — ", text)
+
+    # 공백-문장부호 간격 정리
+    text = re.sub(r"\s+([,\.!?;:])", r"\1", text)
+
+    # 양끝 불필요한 기호 제거
+    text = text.strip(" -_*=•\t")
+
+    # 마지막 문장부호(. ? !)까지 자르고 마감 (구분선으로 끝나는 현상 방지)
+    m = re.search(r"[\.!?](?!.*[\.!?])", text)
+    if m:
+        text = text[:m.end()]
+    return text
 
 def build_used_prompt(original_prompt: str, tokenizer, n_tokens: int) -> str:
     """Take first N tokens and decode back to text."""
@@ -73,7 +94,29 @@ def load_model():
 
     model.eval()
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+
+    # OPT 일부 체크포인트에 pad_token이 없는 경우 대비
+    if tokenizer.pad_token_id is None and tokenizer.eos_token is not None:
+        tokenizer.pad_token = tokenizer.eos_token
+
     return model, tokenizer, device
+
+def _build_bad_words_ids(tokenizer):
+    """
+    연속 대시/스페이스-대시와 같은 패턴을 금칙어로 등록하여 구분선 폭주 억제.
+    일반적인 하이픈 사용은 허용하고, 4개 이상 연속 패턴만 막음.
+    """
+    ban_patterns = [
+        "----", "-----", "------", "-------", "--------",
+        "- - - -", "- - - - -", "- - - - - -",
+        "— — —", "— — — —", "———", "————"
+    ]
+    ids = []
+    for p in ban_patterns:
+        enc = tokenizer.encode(p, add_special_tokens=False)
+        if enc:  # 빈 리스트는 제외 (HF 스펙)
+            ids.append(enc)
+    return ids if ids else None  # 아무것도 없으면 None 반환
 
 def generate(prompt, model, tokenizer, device):
     """Generate watermarked text using WatermarkLogitsProcessor."""
@@ -85,7 +128,7 @@ def generate(prompt, model, tokenizer, device):
         select_green_tokens=True,
         cluster_data_path=CLUSTER_DATA_PATH,
         use_sampling=True,
-        sampling_temp=0.7,
+        sampling_temp=0.6,
         n_beams=1,
         max_new_tokens=MAX_NEW_TOKENS,
         generation_seed=123,
@@ -102,10 +145,26 @@ def generate(prompt, model, tokenizer, device):
         cluster_data_path=args.cluster_data_path,
     )
 
-    gen_kwargs = dict(max_new_tokens=args.max_new_tokens)
-    gen_kwargs.update(dict(do_sample=True, top_k=0, temperature=args.sampling_temp))
+    bad_words_ids = _build_bad_words_ids(tokenizer)
 
-    tokd_input = tokenizer(prompt, return_tensors="pt", add_special_tokens=True, truncation=True).to(device)
+    gen_kwargs = dict(
+        max_new_tokens=args.max_new_tokens,
+        do_sample=True,
+        temperature=args.sampling_temp,
+        top_k=50,
+        top_p=0.95,                 
+        no_repeat_ngram_size=3,   
+        repetition_penalty=1.1,     
+        eos_token_id=tokenizer.eos_token_id,
+        pad_token_id=tokenizer.pad_token_id,
+    )
+    if bad_words_ids is not None:
+        gen_kwargs["bad_words_ids"] = bad_words_ids  # 추가: 긴 구분선 직접 차단
+
+    tokd_input = tokenizer(
+        prompt, return_tensors="pt", add_special_tokens=True, truncation=True
+    ).to(device)
+
     torch.manual_seed(args.generation_seed)
     output = model.generate(
         **tokd_input,
@@ -157,38 +216,75 @@ def main():
     df = pd.read_csv(INPUT_CSV)
     prompt_col = "data" if "data" in df.columns else df.columns[0]
 
+    # 기존 결과가 있으면 읽어서 이어쓰기 모드로 전환
+    processed_ids = set()
     outputs = []
-
-
-    for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing"):
-        original = str(row[prompt_col]) if not pd.isna(row[prompt_col]) else ""
-        if not original.strip():
-            continue
-
+    if os.path.exists(OUTPUT_CSV):
         try:
-            processed = preprocess_for_model(original)
-            used_prompt = build_used_prompt(processed, tokenizer, NUM_PROMPT_TOKENS)
-            generated_raw = generate(used_prompt, model, tokenizer, device)
-            generated_clean = clean_generated_text(generated_raw)
-            scores = detection_scores_raw(generated_raw, tokenizer, device)
-
-            outputs.append({
-                "id": idx,
-                "original_prompt": original,
-                "used_prompt": used_prompt,
-                "generated_text_raw": generated_raw,
-                "generated_text_clean": generated_clean,
-                "p_value": scores["p_value"],
-                "z_score": scores["z_score"],
-            })
-
+            prev = pd.read_csv(OUTPUT_CSV)
+            if "id" in prev.columns:
+                processed_ids = set(prev["id"].tolist())
+                print(f"Found existing output with {len(processed_ids)} rows. Resuming...")
+            outputs = prev.to_dict(orient="records")
         except Exception as e:
-            print(f"[Error idx={idx}] {e}")
-            print(traceback.format_exc())
+            print(f"[Warn] Failed to read existing OUTPUT_CSV: {e}")
+            outputs = []
+
+    # 주기적 저장 간격 (필요시 1로 낮추면 샘플마다 저장)
+    SAVE_EVERY = 10
+    since_last_save = 0
+
+    try:
+        for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing"):
+            # 이미 처리한 행이면 건너뜀
+            if idx in processed_ids:
+                continue
+
+            original = str(row[prompt_col]) if not pd.isna(row[prompt_col]) else ""
+            if not original.strip():
+                continue
+
+            try:
+                processed = preprocess_for_model(original)
+                used_prompt = build_used_prompt(processed, tokenizer, NUM_PROMPT_TOKENS)
+                generated_raw = generate(used_prompt, model, tokenizer, device)
+                generated_clean = clean_generated_text(generated_raw)
+                scores = detection_scores_raw(generated_raw, tokenizer, device)
+
+                ascii_only = lambda s: re.sub(r"[^\x00-\x7F]+", "", s or "")
+                outputs.append({
+                    "id": idx,
+                    "original_prompt": ascii_only(original),
+                    "used_prompt": ascii_only(used_prompt),
+                    "generated_text_raw": ascii_only(generated_raw),
+                    "generated_text_clean": clean_generated_text(generated_raw),
+                    "p_value": scores.get("p_value", ""),
+                    "z_score": scores.get("z_score", ""),
+                })
+
+                processed_ids.add(idx)
+                since_last_save += 1
+
+                if since_last_save >= SAVE_EVERY:
+                    os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
+                    pd.DataFrame(outputs).to_csv(
+                        OUTPUT_CSV, index=False, quoting=csv.QUOTE_ALL, escapechar='\\'
+                    )
+                    since_last_save = 0
+
+            except Exception as e:
+                print(f"[Error idx={idx}] {e}")
+                print(traceback.format_exc())
+
+    except KeyboardInterrupt:
+        print("\nInterrupted by user (Ctrl+C). Saving partial results...\n")
 
     os.makedirs(os.path.dirname(OUTPUT_CSV), exist_ok=True)
-    pd.DataFrame(outputs).to_csv(OUTPUT_CSV, index=False, quoting=csv.QUOTE_MINIMAL)
-    print(f"\n Saved to {OUTPUT_CSV}\n")
+    pd.DataFrame(outputs).to_csv(
+        OUTPUT_CSV, index=False, quoting=csv.QUOTE_ALL, escapechar='\\'
+    )
+    print(f"\nSaved {len(outputs)} total results to {OUTPUT_CSV}\n")
 
 if __name__ == "__main__":
     main()
+
