@@ -14,42 +14,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# from argparse import Namespace
-# args = Namespace()
+from argparse import Namespace
+args = Namespace()
 
-#  arg_dict = {
-#     'run_gradio': True, 
-#     'demo_public': False, 
-#      'model_name_or_path': 'facebook/opt-125m', 
-#     # 'model_name_or_path': 'facebook/opt-1.3b', 
-#     # 'model_name_or_path': 'facebook/opt-2.7b', 
-#     # 'model_name_or_path': 'facebook/opt-6.7b',
-#     # 'model_name_or_path': 'facebook/opt-13b',
-#     # 'load_fp16' : True,
-#     'load_fp16' : True,
-#     'prompt_max_length': None, 
-#     'max_new_tokens': 50, 
-#     'generation_seed': 123, 
-#     'use_sampling': True, 
-#     'n_beams': 1, 
-#     'sampling_temp': 0.7, 
-#     'use_gpu': True, 
-#     'seeding_scheme': 'simple_1', 
-#     'gamma': 0.25, 
-#     'delta': 2.0, 
-#     'normalizers': '', 
-#     'ignore_repeated_bigrams': False, 
-#     'detection_z_threshold': 4.0, 
-#     'select_green_tokens': True,
-#     'skip_model_load': False,
-#     'seed_separately': True,
-#     'default_prompt': "This is the default prompt for generating text."
-# }
+arg_dict = {
+    'run_gradio': True, 
+    'demo_public': False, 
+    # 'model_name_or_path': 'facebook/opt-125m', 
+    'model_name_or_path': 'facebook/opt-1.3b', 
+    # 'model_name_or_path': 'facebook/opt-2.7b', 
+    # 'model_name_or_path': 'facebook/opt-6.7b',
+    # 'model_name_or_path': 'facebook/opt-13b',
+    # 'load_fp16' : True,
+    'load_fp16' : False,
+    'prompt_max_length': None, 
+    'max_new_tokens': 200, 
+    'generation_seed': 123, 
+    'use_sampling': True, 
+    'n_beams': 1, 
+    'sampling_temp': 0.7, 
+    'use_gpu': True, 
+    'seeding_scheme': 'simple_1', 
+    'gamma': 0.25, 
+    'delta': 2.0,
+    'cluster_gamma': 0.5, # 추가됨: 클러스터 워터마킹 확률
+    'normalizers': '', 
+    'ignore_repeated_bigrams': False, 
+    'detection_z_threshold': 4.0, 
+    'select_green_tokens': True,
+    'skip_model_load': False,
+    'seed_separately': True,
+}
 
-# args.__dict__.update(arg_dict)
+args.__dict__.update(arg_dict)
 
-from demo_watermark import main, parse_args
+from demo_watermark_origin import main
 
-if __name__ == "__main__":
-    args = parse_args()  
-    main(args)
+main(args)

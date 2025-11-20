@@ -46,7 +46,7 @@ def str2bool(v):
 def parse_args():
     """Command line argument specification"""
 
-    parser = argparse.ArgumentParser(description="A minimum working example of applying the watermark to any LLM that supports the huggingface 🤗 `generate` API")
+    parser = argparse.ArgumentParser(description="A minimum working example of applying the watermark to any LLM that supports the huggingface ､`generate` API")
 
     parser.add_argument(
         "--run_gradio",
@@ -125,6 +125,13 @@ def parse_args():
         type=float,
         default=2.0,
         help="The amount/bias to add to each of the greenlist token logits before each token sampling step.",
+    )
+    # --- 수정됨: cluster_gamma 인자 추가 ---
+    parser.add_argument(
+        "--cluster_gamma",
+        type=float,
+        default=0.5,
+        help="The probability of using cluster-aware partitioning (vs token-aware).",
     )
     parser.add_argument(
         "--cluster_data_path",
@@ -213,13 +220,15 @@ def generate(prompt, args, model=None, device=None, tokenizer=None):
     
     print(f"Generating with {args}")
 
+    # --- 수정됨: cluster_gamma 파라미터 전달 ---
     watermark_processor = WatermarkLogitsProcessor(vocab=list(tokenizer.get_vocab().values()),
                                                     gamma=args.gamma,
                                                     delta=args.delta,
                                                     seeding_scheme=args.seeding_scheme,
                                                     select_green_tokens=args.select_green_tokens,
                                                     tokenizer=tokenizer,
-                                                    cluster_data_path=args.cluster_data_path)
+                                                    cluster_data_path=args.cluster_data_path,
+                                                    cluster_gamma=args.cluster_gamma) # 전달
 
     gen_kwargs = dict(max_new_tokens=args.max_new_tokens)
 
@@ -312,6 +321,8 @@ def list_format_scores(score_dict, detection_threshold):
 def detect(input_text, args, device=None, tokenizer=None):
     """Instantiate the WatermarkDetection object and call detect on
         the input text returning the scores and outcome of the test"""
+    
+    # --- 수정됨: cluster_gamma 파라미터 전달 ---
     watermark_detector = WatermarkDetector(vocab=list(tokenizer.get_vocab().values()),
                                         gamma=args.gamma,
                                         seeding_scheme=args.seeding_scheme,
@@ -321,7 +332,9 @@ def detect(input_text, args, device=None, tokenizer=None):
                                         z_threshold=args.detection_z_threshold,
                                         normalizers=args.normalizers,
                                         ignore_repeated_bigrams=args.ignore_repeated_bigrams,
-                                        select_green_tokens=args.select_green_tokens)
+                                        select_green_tokens=args.select_green_tokens,
+                                        cluster_gamma=args.cluster_gamma) # 전달
+    
     if len(input_text)-1 > watermark_detector.min_prefix_len:
         score_dict = watermark_detector.detect(input_text)
         # output = str_format_scores(score_dict, watermark_detector.z_threshold)
@@ -343,7 +356,7 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
             with gr.Column(scale=9):
                 gr.Markdown(
                 """
-                ## 💧 [A Watermark for Large Language Models](https://arxiv.org/abs/2301.10226) 🔍
+                ## 挑 [A Watermark for Large Language Models](https://arxiv.org/abs/2301.10226) 剥
                 """
                 )
             with gr.Column(scale=1):
@@ -453,6 +466,10 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                         gamma = gr.Slider(label="gamma",minimum=0.1, maximum=0.9, step=0.05, value=args.gamma)
                     with gr.Row():
                         delta = gr.Slider(label="delta",minimum=0.0, maximum=10.0, step=0.1, value=args.delta)
+                    # --- 수정됨: Cluster Gamma Slider 추가 ---
+                    with gr.Row():
+                        cluster_gamma = gr.Slider(label="cluster gamma", minimum=0.0, maximum=1.0, step=0.05, value=args.cluster_gamma)
+                    
                     gr.Markdown(f"#### Detector Parameters")
                     with gr.Row():
                         detection_z_threshold = gr.Slider(label="z-score threshold",minimum=0.0, maximum=10.0, step=0.1, value=args.detection_z_threshold)
@@ -502,6 +519,8 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
                         and as the bias becomes very large the watermark transitions from "soft" to "hard". 
                         For a hard watermark, nearly all tokens are green, but this can have a detrimental effect on
                         generation quality, especially when there is not a lot of flexibility in the distribution.
+            - cluster gamma : The probability of using the cluster-aware partitioning method versus the token-aware method.
+                              If set to 0.0, it behaves like the original watermarking. If 1.0, it always uses cluster-based logic.
 
             #### Detector Parameters:
             
@@ -549,6 +568,8 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         def update_generation_seed(session_state, value): session_state.generation_seed = int(value); return session_state
         def update_gamma(session_state, value): session_state.gamma = float(value); return session_state
         def update_delta(session_state, value): session_state.delta = float(value); return session_state
+        # --- 수정됨: cluster_gamma 업데이트 콜백 ---
+        def update_cluster_gamma(session_state, value): session_state.cluster_gamma = float(value); return session_state
         def update_detection_z_threshold(session_state, value): session_state.detection_z_threshold = float(value); return session_state
         def update_decoding(session_state, value):
             if value == "multinomial":
@@ -584,6 +605,10 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         max_new_tokens.change(update_max_new_tokens,inputs=[session_args, max_new_tokens], outputs=[session_args])
         gamma.change(update_gamma,inputs=[session_args, gamma], outputs=[session_args])
         delta.change(update_delta,inputs=[session_args, delta], outputs=[session_args])
+        
+        # --- 수정됨: cluster_gamma 변경 리스너 등록 ---
+        cluster_gamma.change(update_cluster_gamma, inputs=[session_args, cluster_gamma], outputs=[session_args])
+        
         detection_z_threshold.change(update_detection_z_threshold,inputs=[session_args, detection_z_threshold], outputs=[session_args])
         ignore_repeated_bigrams.change(update_ignore_repeated_bigrams,inputs=[session_args, ignore_repeated_bigrams], outputs=[session_args])
         normalizers.change(update_normalizers,inputs=[session_args, normalizers], outputs=[session_args])
@@ -597,6 +622,13 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
         gamma.change(fn=detect_partial, inputs=[output_without_watermark,session_args], outputs=[without_watermark_detection_result,session_args])
         gamma.change(fn=detect_partial, inputs=[output_with_watermark,session_args], outputs=[with_watermark_detection_result,session_args])
         gamma.change(fn=detect_partial, inputs=[detection_input,session_args], outputs=[detection_result,session_args])
+
+        # --- 수정됨: cluster_gamma 변경 시 즉시 업데이트 및 재탐지 ---
+        cluster_gamma.change(lambda value: str(value), inputs=[session_args], outputs=[current_parameters])
+        cluster_gamma.change(fn=detect_partial, inputs=[output_without_watermark,session_args], outputs=[without_watermark_detection_result,session_args])
+        cluster_gamma.change(fn=detect_partial, inputs=[output_with_watermark,session_args], outputs=[with_watermark_detection_result,session_args])
+        cluster_gamma.change(fn=detect_partial, inputs=[detection_input,session_args], outputs=[detection_result,session_args])
+
         detection_z_threshold.change(lambda value: str(value), inputs=[session_args], outputs=[current_parameters])
         detection_z_threshold.change(fn=detect_partial, inputs=[output_without_watermark,session_args], outputs=[without_watermark_detection_result,session_args])
         detection_z_threshold.change(fn=detect_partial, inputs=[output_with_watermark,session_args], outputs=[with_watermark_detection_result,session_args])

@@ -28,7 +28,7 @@ class WatermarkBase:
         cluster_data_path: str = "cluster_data.npz",
         tokenizer: Tokenizer = None,  
 
-        cluster_gamma: float = 0.15, # 클러스터 분할 방식을 사용할 "확률" (0.0 ~ 1.0)
+        cluster_gamma: float = 0.5, # 클러스터 분할 방식을 사용할 "확률" (0.0 ~ 1.0)
     ):
 
         # watermarking parameters
@@ -222,6 +222,7 @@ class WatermarkDetector(WatermarkBase):
     ):
         # WatermarkBase가 클러스터링을 위해 tokenizer를 필요로 하므로,
         # super() 호출 시 명시적으로 전달해야 합니다.
+        # cluster_gamma는 **kwargs에 포함되어 전달됩니다.
         super().__init__(*args, tokenizer=tokenizer, **kwargs)
         
         assert device, "Must pass device"
