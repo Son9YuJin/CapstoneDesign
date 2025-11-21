@@ -22,6 +22,8 @@ from functools import partial
 
 import numpy # for gradio hot reload
 import gradio as gr
+import pandas as pd
+import statistics
 
 import torch
 
@@ -51,7 +53,7 @@ def parse_args():
     parser.add_argument(
         "--run_gradio",
         type=str2bool,
-        default=True,
+        default=False,
         help="Whether to launch as a gradio demo. Set to False if not installed and want to just run the stdout version.",
     )
     parser.add_argument(
@@ -63,7 +65,7 @@ def parse_args():
     parser.add_argument(
         "--model_name_or_path",
         type=str,
-        default="facebook/opt-6.7b",
+        default="facebook/opt-350m",
         help="Main model, path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -181,6 +183,19 @@ def parse_args():
         default=False,
         help="Whether to run model in float16 precsion.",
     )
+    parser.add_argument(
+        "--run_param_sweep",
+        type=str2bool,
+        default=True,
+        help="If True, run parameter sweep on dataset/human_prompts.csv and save z/p means to CSV.",
+    )
+    parser.add_argument(
+        "--num_prompts",
+        type=int,
+        default=None,
+        help="How many prompts from dataset/human_prompts.csv to use for param sweep (None = all).",
+    )
+
     args = parser.parse_args()
     return args
 
@@ -344,6 +359,28 @@ def detect(input_text, args, device=None, tokenizer=None):
         output = [["Error","string too short to compute metrics"]]
         output += [["",""] for _ in range(6)]
     return output, args
+
+def detect_raw(input_text, args, device=None, tokenizer=None):
+    """
+    detect()랑 비슷하지만, Gradio용 2D 리스트 대신
+    WatermarkDetector.detect()가 리턴하는 원래 score_dict를 그대로 돌려준다.
+    (여기서 z_score, p_value를 꺼내 쓸 거임)
+    """
+    watermark_detector = WatermarkDetector(
+        vocab=list(tokenizer.get_vocab().values()),
+        gamma=args.gamma,
+        seeding_scheme=args.seeding_scheme,
+        device=device,
+        tokenizer=tokenizer,
+        cluster_data_path=args.cluster_data_path,
+        z_threshold=args.detection_z_threshold,
+        normalizers=args.normalizers,
+        ignore_repeated_bigrams=args.ignore_repeated_bigrams,
+        select_green_tokens=args.select_green_tokens,
+        cluster_gamma=args.cluster_gamma,
+    )
+    return watermark_detector.detect(input_text)
+
 
 def run_gradio(args, model=None, device=None, tokenizer=None):
     """Define and launch the gradio demo interface"""
@@ -654,10 +691,128 @@ def run_gradio(args, model=None, device=None, tokenizer=None):
     else:
         demo.launch()
 
+def run_param_sweep(args, model=None, device=None, tokenizer=None):
+    # 0. 데이터 불러오기
+    prompt_csv_path = os.path.join("dataset", "human_prompts.csv")
+    if not os.path.exists(prompt_csv_path):
+        print(f"[param_sweep] 프롬프트 파일 없음: {prompt_csv_path}")
+        return
+
+    df = pd.read_csv(prompt_csv_path)
+
+    # 텍스트 컬럼 자동 추론
+    text_col = None
+    for cand in ["data", "text", "prompt", "content"]:
+        if cand in df.columns:
+            text_col = cand
+            break
+
+    if text_col is None:
+        if len(df.columns) >= 2:
+            text_col = df.columns[1]
+        else:
+            text_col = df.columns[0]
+
+    prompts = df[text_col].tolist()
+    if args.num_prompts is not None:
+        prompts = prompts[: args.num_prompts]
+
+    print(f"[param_sweep] 프롬프트 {len(prompts)}개 사용 (컬럼: {text_col})")
+
+    # 실험할 파라미터 조합들
+    PARAM_CASES = [
+        {"cluster_gamma": 0.15, "delta": 2.0},
+        {"cluster_gamma": 0.15, "delta": 4.0},
+        {"cluster_gamma": 0.15, "delta": 8.0},
+        # {"cluster_gamma": 0.15, "delta": float("inf")},
+        {"cluster_gamma": 0.25, "delta": 2.0},
+        {"cluster_gamma": 0.25, "delta": 4.0},
+        {"cluster_gamma": 0.25, "delta": 8.0},
+        # {"cluster_gamma": 0.25, "delta": float("inf")},
+        {"cluster_gamma": 0.5,  "delta": 2.0},
+        {"cluster_gamma": 0.5,  "delta": 4.0},
+        {"cluster_gamma": 0.5,  "delta": 8.0},
+        #  {"cluster_gamma": 0.5,  "delta": float("inf")},
+        {"cluster_gamma": 0.75, "delta": 2.0},
+        {"cluster_gamma": 0.75, "delta": 4.0},
+        {"cluster_gamma": 0.75, "delta": 8.0},
+        # {"cluster_gamma": 0.75, "delta": float("inf")},
+        {"cluster_gamma": 1.0,  "delta": 2.0},
+        {"cluster_gamma": 1.0,  "delta": 4.0},
+        {"cluster_gamma": 1.0,  "delta": 8.0},
+        # {"cluster_gamma": 1.0,  "delta": float("inf")},
+    ]
+
+    mean_rows = []   # 조합별 평균만 저장
+
+    for case in PARAM_CASES:
+        cg = float(case["cluster_gamma"])
+        delta = float(case["delta"])
+
+        print(f"\n[param_sweep] 케이스: cluster_gamma={cg}, delta={delta}")
+
+        # args 복사해서 이 케이스용으로 사용
+        case_args = Namespace(**vars(args))
+        case_args.cluster_gamma = cg
+        case_args.delta = delta
+
+        z_list = []
+        p_list = []
+
+        for idx, prompt in enumerate(prompts):
+            # 워터마크 텍스트 생성
+            _, _, _, watermarked_text, _ = generate(
+                prompt,
+                case_args,
+                model=model,
+                device=device,
+                tokenizer=tokenizer,
+            )
+
+            # z, p 계산
+            scores = detect_raw(
+                watermarked_text,
+                case_args,
+                device=device,
+                tokenizer=tokenizer,
+            )
+            z = float(scores["z_score"])
+            p = float(scores["p_value"])
+
+            z_list.append(z)
+            p_list.append(p)
+
+            if (idx + 1) % 10 == 0 or (idx + 1) == len(prompts):
+                print(f"  - {idx+1}/{len(prompts)} 개 완료")
+
+        mean_z = statistics.fmean(z_list)
+        mean_p = statistics.fmean(p_list)
+
+        print(
+            f"[param_sweep] 평균 z = {mean_z:.3f}, 평균 p = {mean_p:.3g} "
+            f"(n={len(z_list)})"
+        )
+
+        mean_rows.append(
+            {
+                "cluster_gamma": cg,
+                "delta": delta,
+                "mean_z_score": mean_z,
+                "mean_p_value": mean_p,
+                "num_samples": len(z_list),
+            }
+        )
+
+    # 🔹 조합별 평균만 CSV로 저장
+    mean_df = pd.DataFrame(mean_rows)
+    mean_df.to_csv("param_means.csv", index=False, encoding="utf-8")
+
+    print("\n[param_sweep] 완료")
+    print("  - 조합별 평균: param_means.csv")
+
 def main(args): 
     """Run a command line version of the generation and detection operations
         and optionally launch and serve the gradio demo"""
-    # Initial arg processing and log
     args.normalizers = (args.normalizers.split(",") if args.normalizers else [])
     print(args)
 
@@ -666,8 +821,7 @@ def main(args):
     else:
         model, tokenizer, device = None, None, None
 
-    # Generate and detect, report to stdout
-    if not args.skip_model_load:
+    if not args.skip_model_load and not args.run_param_sweep:
         input_text = (
         "The diamondback terrapin or simply terrapin (Malaclemys terrapin) is a "
         "species of turtle native to the brackish coastal tidal marshes of the "
@@ -698,19 +852,25 @@ def main(args):
         print("Prompt:")
         print(input_text)
 
-        _, _, decoded_output_without_watermark, decoded_output_with_watermark, _ = generate(input_text, 
-                                                                                            args, 
-                                                                                            model=model, 
-                                                                                            device=device, 
-                                                                                            tokenizer=tokenizer)
-        without_watermark_detection_result = detect(decoded_output_without_watermark, 
-                                                    args, 
-                                                    device=device, 
-                                                    tokenizer=tokenizer)
-        with_watermark_detection_result = detect(decoded_output_with_watermark, 
-                                                 args, 
-                                                 device=device, 
-                                                 tokenizer=tokenizer)
+        _, _, decoded_output_without_watermark, decoded_output_with_watermark, _ = generate(
+            input_text, 
+            args, 
+            model=model, 
+            device=device, 
+            tokenizer=tokenizer
+        )
+        without_watermark_detection_result = detect(
+            decoded_output_without_watermark, 
+            args, 
+            device=device, 
+            tokenizer=tokenizer
+        )
+        with_watermark_detection_result = detect(
+            decoded_output_with_watermark, 
+            args, 
+            device=device, 
+            tokenizer=tokenizer
+        )
 
         print("#"*term_width)
         print("Output without watermark:")
@@ -728,8 +888,9 @@ def main(args):
         pprint(with_watermark_detection_result)
         print("-"*term_width)
 
+    if args.run_param_sweep:
+        run_param_sweep(args, model=model, device=device, tokenizer=tokenizer)
 
-    # Launch the app to generate and detect interactively (implements the hf space demo)
     if args.run_gradio:
         run_gradio(args, model=model, tokenizer=tokenizer, device=device)
 
