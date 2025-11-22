@@ -21,8 +21,8 @@ from watermark_processor import WatermarkLogitsProcessor, WatermarkDetector
 # ========================== CONFIG ==========================
 # best parameters
 BEST_GAMMA = 0.25    # greenlist로 보낼 토큰 비율(고정)
-BEST_DELTA = 4.0    # greenlist 토큰에 더해줄 logit 보정 세기
-BEST_CLUSTER_GAMMA = 0.25   # 클러스터 워터마킹 사용 비율 
+BEST_DELTA = 3.0    # greenlist 토큰에 더해줄 logit 보정 세기
+BEST_CLUSTER_GAMMA = 0.5   # 클러스터 워터마킹 사용 비율 
 
 INPUT_CSV = "dataset/human_prompts.csv"
 OUTPUT_CSV = f"dataset/clustering_wm_gamma{BEST_GAMMA}_delta{BEST_DELTA}_cg{BEST_CLUSTER_GAMMA}.csv"
