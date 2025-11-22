@@ -721,22 +721,27 @@ def run_param_sweep(args, model=None, device=None, tokenizer=None):
 
     # 실험할 파라미터 조합들
     PARAM_CASES = [
+        {"cluster_gamma": 0.15, "delta": 1.0},
         {"cluster_gamma": 0.15, "delta": 2.0},
         {"cluster_gamma": 0.15, "delta": 4.0},
         {"cluster_gamma": 0.15, "delta": 8.0},
         # {"cluster_gamma": 0.15, "delta": float("inf")},
+        {"cluster_gamma": 0.25, "delta": 1.0},
         {"cluster_gamma": 0.25, "delta": 2.0},
         {"cluster_gamma": 0.25, "delta": 4.0},
         {"cluster_gamma": 0.25, "delta": 8.0},
         # {"cluster_gamma": 0.25, "delta": float("inf")},
+        {"cluster_gamma": 0.5,  "delta": 1.0},
         {"cluster_gamma": 0.5,  "delta": 2.0},
         {"cluster_gamma": 0.5,  "delta": 4.0},
         {"cluster_gamma": 0.5,  "delta": 8.0},
         #  {"cluster_gamma": 0.5,  "delta": float("inf")},
+        {"cluster_gamma": 0.75, "delta": 1.0},
         {"cluster_gamma": 0.75, "delta": 2.0},
         {"cluster_gamma": 0.75, "delta": 4.0},
         {"cluster_gamma": 0.75, "delta": 8.0},
         # {"cluster_gamma": 0.75, "delta": float("inf")},
+        {"cluster_gamma": 1.0,  "delta": 1.0},
         {"cluster_gamma": 1.0,  "delta": 2.0},
         {"cluster_gamma": 1.0,  "delta": 4.0},
         {"cluster_gamma": 1.0,  "delta": 8.0},
@@ -804,10 +809,23 @@ def run_param_sweep(args, model=None, device=None, tokenizer=None):
         )
 
     # 🔹 조합별 평균만 CSV로 저장
-    mean_df = pd.DataFrame(mean_rows)
-    mean_df.to_csv("param_means.csv", index=False, encoding="utf-8")
+        output_path = "param_means.csv"
+    new_df = pd.DataFrame(mean_rows)
 
-    print("\n[param_sweep] 완료")
+    if os.path.exists(output_path):
+        # 기존 결과 불러와서 새 결과와 합치기
+        old_df = pd.read_csv(output_path)
+
+        combined = pd.concat([old_df, new_df], ignore_index=True)
+
+        combined = combined.drop_duplicates(subset=["cluster_gamma", "delta"], keep="last")
+
+        combined.to_csv(output_path, index=False, encoding="utf-8")
+        print(f"\n[param_sweep] 기존 파일에 결과 추가 저장 완료 -> {output_path}")
+    else:
+        new_df.to_csv(output_path, index=False, encoding="utf-8")
+        print(f"\n[param_sweep] 새 파일 생성 -> {output_path}")
+
     print("  - 조합별 평균: param_means.csv")
 
 def main(args): 
