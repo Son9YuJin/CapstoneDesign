@@ -19,14 +19,20 @@ from transformers import (
 from watermark_processor import WatermarkLogitsProcessor, WatermarkDetector
 
 # ========================== CONFIG ==========================
+# best parameters
+BEST_GAMMA = 0.25    # greenlist로 보낼 토큰 비율(고정)
+BEST_DELTA = 4.0    # greenlist 토큰에 더해줄 logit 보정 세기
+BEST_CLUSTER_GAMMA = 0.25   # 클러스터 워터마킹 사용 비율 
+
 INPUT_CSV = "dataset/human_prompts.csv"
-OUTPUT_CSV = "dataset/clustering_wm.csv"
+OUTPUT_CSV = f"dataset/clustering_wm_gamma{BEST_GAMMA}_delta{BEST_DELTA}_cg{BEST_CLUSTER_GAMMA}.csv"
 MODEL_NAME = "facebook/opt-125m"
 USE_GPU = True
 MAX_NEW_TOKENS = 100
 CLUSTER_DATA_PATH = "cluster_data.npz"
 NUM_PROMPT_TOKENS = 100
 # ============================================================
+
 
 def preprocess_for_model(text: str) -> str:
     """Preprocessing before truncation or feeding into model."""
@@ -37,6 +43,7 @@ def preprocess_for_model(text: str) -> str:
     text = re.sub(r"[^\x00-\x7F]+", "", text)
     return text.strip()
 
+
 def clean_generated_text(text: str) -> str:
     if text is None:
         return ""
@@ -45,7 +52,7 @@ def clean_generated_text(text: str) -> str:
     text = text.replace("\r", " ").replace("\n", " ")
     text = re.sub(r"\s+", " ", text).strip()
 
-    # 완전한 비ASCII 문자 제거 
+    # 완전한 비ASCII 문자 제거
     text = re.sub(r"[^\x00-\x7F]+", "", text)
 
     # 한글 및 자모 제거
@@ -67,12 +74,14 @@ def clean_generated_text(text: str) -> str:
         text = text[:m.end()]
     return text
 
+
 def build_used_prompt(original_prompt: str, tokenizer, n_tokens: int) -> str:
     """Take first N tokens and decode back to text."""
     ids = tokenizer.encode(original_prompt, add_special_tokens=False)
     truncated = ids[:n_tokens]
     used = tokenizer.decode(truncated, clean_up_tokenization_spaces=True, skip_special_tokens=True)
     return preprocess_for_model(used)
+
 
 def load_model():
     """Load model and tokenizer."""
@@ -101,6 +110,7 @@ def load_model():
 
     return model, tokenizer, device
 
+
 def _build_bad_words_ids(tokenizer):
     """
     연속 대시/스페이스-대시와 같은 패턴을 금칙어로 등록하여 구분선 폭주 억제.
@@ -118,12 +128,13 @@ def _build_bad_words_ids(tokenizer):
             ids.append(enc)
     return ids if ids else None  # 아무것도 없으면 None 반환
 
+
 def generate(prompt, model, tokenizer, device):
     """Generate watermarked text using WatermarkLogitsProcessor."""
     from argparse import Namespace
     args = Namespace(
-        gamma=0.25,
-        delta=2.0,
+        gamma=BEST_GAMMA,              
+        delta=BEST_DELTA,              
         seeding_scheme="simple_1",
         select_green_tokens=True,
         cluster_data_path=CLUSTER_DATA_PATH,
@@ -133,6 +144,7 @@ def generate(prompt, model, tokenizer, device):
         max_new_tokens=MAX_NEW_TOKENS,
         generation_seed=123,
         is_decoder_only_model=True,
+        cluster_gamma=BEST_CLUSTER_GAMMA,  
     )
 
     watermark_processor = WatermarkLogitsProcessor(
@@ -143,6 +155,7 @@ def generate(prompt, model, tokenizer, device):
         select_green_tokens=args.select_green_tokens,
         tokenizer=tokenizer,
         cluster_data_path=args.cluster_data_path,
+        cluster_gamma=args.cluster_gamma,  
     )
 
     bad_words_ids = _build_bad_words_ids(tokenizer)
@@ -152,9 +165,9 @@ def generate(prompt, model, tokenizer, device):
         do_sample=True,
         temperature=args.sampling_temp,
         top_k=50,
-        top_p=0.95,                 
-        no_repeat_ngram_size=3,   
-        repetition_penalty=1.1,     
+        top_p=0.95,
+        no_repeat_ngram_size=3,
+        repetition_penalty=1.1,
         eos_token_id=tokenizer.eos_token_id,
         pad_token_id=tokenizer.pad_token_id,
     )
@@ -178,16 +191,18 @@ def generate(prompt, model, tokenizer, device):
     decoded_output = tokenizer.batch_decode(output, skip_special_tokens=True)[0]
     return decoded_output
 
+
 def detection_scores_raw(text: str, tokenizer, device):
     """Compute watermark detection raw scores."""
     args = type("Args", (), {})()
-    args.gamma = 0.25
+    args.gamma = BEST_GAMMA
     args.seeding_scheme = "simple_1"
     args.cluster_data_path = CLUSTER_DATA_PATH
     args.detection_z_threshold = 4.0
     args.normalizers = []
     args.ignore_repeated_bigrams = False
     args.select_green_tokens = True
+    args.cluster_gamma = BEST_CLUSTER_GAMMA   
 
     wm_detector = WatermarkDetector(
         vocab=list(tokenizer.get_vocab().values()),
@@ -200,6 +215,7 @@ def detection_scores_raw(text: str, tokenizer, device):
         normalizers=args.normalizers,
         ignore_repeated_bigrams=args.ignore_repeated_bigrams,
         select_green_tokens=args.select_green_tokens,
+        cluster_gamma=args.cluster_gamma,   
     )
 
     if len(text) - 1 <= wm_detector.min_prefix_len:
@@ -207,6 +223,7 @@ def detection_scores_raw(text: str, tokenizer, device):
 
     result = wm_detector.detect(text)
     return {"p_value": result.get("p_value", ""), "z_score": result.get("z_score", "")}
+
 
 def main():
     model, tokenizer, device = load_model()
@@ -285,6 +302,6 @@ def main():
     )
     print(f"\nSaved {len(outputs)} total results to {OUTPUT_CSV}\n")
 
+
 if __name__ == "__main__":
     main()
-
