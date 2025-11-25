@@ -350,7 +350,25 @@ def attack_doc(text, nlp, per_doc_percent, seed, synonym_ratio, global_state):
     # 문서마다 랜덤 선택을 재현 가능하게 하기 위해 seed + hash(text) 사용
     rng = random.Random(seed + (hash(text) & 0xffffffff))
     pick_n = min(doc_budget, len(candidates))
-    picked = sorted(rng.sample(candidates, pick_n))
+
+    # 후보 인덱스를 정렬한 뒤, 그 "순서상" 인접한 두 후보가 동시에 선택되지 않도록 선택
+    sorted_cands = sorted(candidates)
+    cand_positions = list(range(len(sorted_cands)))
+    rng.shuffle(cand_positions)
+
+    picked_pos = set()        # sorted_cands 상에서 선택된 위치 인덱스
+    picked = []               # 실제 토큰 인덱스(i)
+
+    for pos in cand_positions:
+        if len(picked) >= pick_n:
+            break
+        # 바로 앞/뒤 후보가 이미 선택되어 있으면 건너뛰기 → 연속 치환 방지
+        if (pos - 1 in picked_pos) or (pos + 1 in picked_pos):
+            continue
+        picked_pos.add(pos)
+        picked.append(sorted_cands[pos])
+
+    picked = sorted(picked)
 
     records = []
 
