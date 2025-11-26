@@ -48,8 +48,8 @@ from watermark_processor import WatermarkDetector
 # ============================================================
 
 # --- 기본 입출력 파일 ---
-CFG_INPUT  = "dataset/clustering_wm.csv"
-CFG_OUTPUT = "dataset/hybrid_attack_result.csv"
+CFG_INPUT  = "dataset/clustering_wm_gamma0.25_delta4.0_cg1.0.csv"
+CFG_OUTPUT = "dataset/hybrid_attack_gamma0.25_delta4.0_cg1.0.csv"
 
 # --- 문서 단위 치환 비율 관련 ---
 # 1) 모든 문서에 같은 비율을 쓸 때:
