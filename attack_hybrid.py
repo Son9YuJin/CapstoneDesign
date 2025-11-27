@@ -42,56 +42,26 @@ import torch
 from transformers import AutoTokenizer
 from watermark_processor import WatermarkDetector
 
-# ============================================================
-#                     HIGH-LEVEL CONFIG
-#       (여기 값만 바꿔가면서 테스트 하면 됨)
-# ============================================================
+# ================== [NEW] HIGH-LEVEL CONFIG ==================
+# 터미널에서 인자 안 줬을 때 사용할 기본값들
+CFG_INPUT = "dataset/clustering_wm_gamma0.25_delta4.0_cg0.25.csv"            
+CFG_OUTPUT = "dataset/hybrid_attack_gamma0.25_delta4.0_cg0.25_p1.0.csv"           
 
-# --- 기본 입출력 파일 ---
-CFG_INPUT  = "dataset/clustering_wm_gamma0.25_delta4.0_cg1.0.csv"
-CFG_OUTPUT = "dataset/hybrid_attack_gamma0.25_delta4.0_cg1.0.csv"
+CFG_PER_DOC_PERCENT = 50.0        # 문서별 치환 비율 기본값 (%)
+CFG_PER_DOC_PERCENT_COL = None    # per-doc-percent 값을 가진 컬럼 이름 (없으면 None)
+CFG_DEFAULT_PER_DOC_PERCENT = 10.0  # per-doc-percent-col이 NaN/이상할 때 fallback
 
-# --- 문서 단위 치환 비율 관련 ---
-# 1) 모든 문서에 같은 비율을 쓸 때:
-#    예: 50.0 → 각 문서 알파벳 토큰의 50% 치환
-CFG_PER_DOC_PERCENT = 50.0
+CFG_GLOBAL_PERCENT = None         # 전체 코퍼스 기준 전역 치환 비율 (예: 5.0). 안 쓰면 None
+CFG_SEED = 42                     # 랜덤 시드
+CFG_SYNONYM_RATIO = 1.0           # 유의어 모드 비율 (0.0~1.0)
 
-# 2) CSV 안에 문서별 비율이 들어있는 컬럼명을 쓸 때:
-#    예: "attack_pct"  / 쓰지 않으면 None
-CFG_PER_DOC_PERCENT_COL = None
-
-# 3) per-doc-percent-col에 값이 비어있거나 잘못된 경우 fallback으로 쓸 값
-CFG_DEFAULT_PER_DOC_PERCENT = 10.0
-
-# --- 전체 코퍼스 기준 치환 비율 (글로벌 캡) ---
-#    예: 5.0 → 전체 알파벳 토큰 중 5%까지만 치환
-#    사용 안 하면 None
-CFG_GLOBAL_PERCENT = None
-
-# --- 랜덤 시드 (텍스트마다 동일한 결과 재현용) ---
-CFG_SEED = 42
-
-# --- 유의어 모드 vs 비유의어 모드 비율 ---
-#  1.0 → 전부 유의어 모드 (클러스터/WordNet 동의어 위주)
-#  0.0 → 전부 비유의어 모드 (WordNet → 없으면 다른 클러스터)
-#  0.5 → 유의어/비유의어 반반 섞기
-CFG_SYNONYM_RATIO = 1.0
-
-# --- 워터마크 검출 / 토크나이저 관련 ---
-CFG_MODEL_NAME      = "facebook/opt-350m"
-CFG_DETECT_GAMMA    = 0.25
-CFG_DETECT_DELTA    = 3.0
-CFG_SEEDING_SCHEME  = "simple_1"
-CFG_Z_COL_NAME      = "z_attack"
-CFG_DEVICE          = None   # "cuda", "cpu", 또는 None(자동 선택)
-
-# ============================================================
-#                     고정 기본 설정들
+CFG_DEVICE = None                 # "cuda", "cpu" 또는 None (자동 선택)
 # ============================================================
 
+# ------------------ 기본 설정 ------------------
 # 입력 CSV에서 사용할 컬럼 이름
 TEXT_COL = "generated_text_clean"      # 원본 텍스트 컬럼
-NEW_COL  = "generated_text_attack"     # 치환 공격 후 텍스트가 저장될 컬럼
+NEW_COL = "generated_text_attack"      # 치환 공격 후 텍스트가 저장될 컬럼
 
 # 치환 로그를 남길 CSV 경로
 LOGMAP = "dataset/substitution_map.csv"
@@ -99,7 +69,7 @@ LOGMAP = "dataset/substitution_map.csv"
 # 클러스터 데이터 npz 파일 경로
 CLUSTER_DATA_PATH = "cluster_data.npz"
 
-# 랜덤 시드 기본값 (config에서 따로 안 주면 사용)
+# 랜덤 시드 기본값
 DEFAULT_SEED = 42
 
 # per-doc-percent / 컬럼 둘 다 없을 때 사용할 기본 퍼센트 (%)
@@ -127,19 +97,40 @@ SPACY2WN = {
     "VERB": wn.VERB,
 }
 
-# 워터마크 검출 기본 설정 (config에서 override)
-DETECT_MODEL_NAME      = CFG_MODEL_NAME
-DETECT_GAMMA           = CFG_DETECT_GAMMA
-DETECT_DELTA           = CFG_DETECT_DELTA
-DETECT_SEEDING_SCHEME  = CFG_SEEDING_SCHEME
-Z_COL_NAME             = CFG_Z_COL_NAME
-DETECT_DEVICE          = CFG_DEVICE   # "cuda", "cpu", 또는 None(자동 선택)
+# [추가] 워터마크 검출 기본 설정
+DETECT_MODEL_NAME = "facebook/opt-350m"
+DETECT_GAMMA = 0.25
+DETECT_DELTA = 3.0
+DETECT_SEEDING_SCHEME = "simple_1"
+Z_COL_NAME = "z_attack"
+DETECT_DEVICE = None   # "cuda", "cpu", 또는 None(자동 선택)
+
+# ------------------ [PATCH] 공통 정규화 함수 ------------------
+def normalize_cluster_token(raw: str) -> str:
+    """
+    cluster_data.npz 토큰과 spaCy 토큰을 클러스터 조회용으로 정규화.
+    예) 'Devices(0.70)' -> 'devices'
+        ' vehicle (0.75)' -> 'vehicle'
+    - 소문자 변환
+    - 앞뒤 공백 제거
+    - '(' 앞까지만 사용 (점수 제거)
+    - 알파벳 이외 문자 제거
+    """
+    if raw is None:
+        return ""
+    text = str(raw).lower().strip()
+    # 괄호 앞까지만 사용 (단어 + (0.73) 형태 처리)
+    if "(" in text:
+        text = text.split("(", 1)[0]
+    # 알파벳만 남기기
+    text = re.sub(r"[^a-z]", "", text)
+    return text
 
 # ------------------ 클러스터 데이터 로드 ------------------
 def load_cluster_maps():
     """
     cluster_data.npz 파일에서 클러스터 정보를 읽어서
-    - token_to_cluster: 토큰(소문자) → 클러스터 ID
+    - token_to_cluster: 토큰(정규화된 소문자) → 클러스터 ID
     - cluster_to_tokens: 클러스터 ID → 해당 클러스터에 속한 토큰 리스트
     - all_words: 전체 토큰 리스트 (비유의어 후보 선택용)
     을 생성한다.
@@ -150,18 +141,17 @@ def load_cluster_maps():
         tokens = data['tokens']
         labels = data['labels']
         
-        # 토큰(소문자) → 클러스터 ID
         token_to_cluster = {}
-        for token, label in zip(tokens, labels):
-            token_to_cluster[str(token).lower()] = label
-            
-        # 클러스터 ID → 토큰 리스트
         cluster_to_tokens = defaultdict(list)
+
         for token, label in zip(tokens, labels):
-            cluster_to_tokens[label].append(str(token).lower())
-        
-        # 전체 토큰 리스트 (중복 제거 후 정렬)
-        all_words = sorted(set(str(t).lower() for t in tokens))
+            norm = normalize_cluster_token(token)
+            if not norm:
+                continue
+            token_to_cluster[norm] = label
+            cluster_to_tokens[label].append(norm)
+
+        all_words = sorted(set(token_to_cluster.keys()))
             
         print(f"[INFO] Attack script loaded {len(token_to_cluster)} tokens into {len(cluster_to_tokens)} clusters.")
         return token_to_cluster, cluster_to_tokens, all_words
@@ -223,7 +213,9 @@ def get_synonym_candidates(token_text):
     [클러스터 유의어 후보]
     - cluster_data.npz에서 같은 클러스터에 속한 토큰들을 유의어 후보로 사용.
     """
-    lemma = token_text.lower()
+    lemma = normalize_cluster_token(token_text)
+    if not lemma:
+        return []
     cluster_id = TOKEN_TO_CLUSTER.get(lemma)
     if cluster_id is None:
         return []
@@ -250,7 +242,9 @@ def get_nonsynonym_candidate(token_text, seed, max_tries=20):
       토큰을 찾는다.
     - WordNet에서도 후보를 찾지 못했을 때 최후 fallback 용도로 사용.
     """
-    lemma = token_text.lower()
+    lemma = normalize_cluster_token(token_text)
+    if not lemma:
+        return None
     cluster_id = TOKEN_TO_CLUSTER.get(lemma)
     if cluster_id is None:
         return None
@@ -320,7 +314,7 @@ def attack_doc(text, nlp, per_doc_percent, seed, synonym_ratio, global_state):
         seed: 랜덤 시드 (재현성)
         synonym_ratio: 
             공격 대상 토큰 중 '몇 %를 유의어 모드'로 교체할지 (0.0 ~ 1.0)
-            - 유의어 모드: 주로 같은 클러스터 안에서 치환
+            - 유의어 모드: 주로 같은 클러스터 안에서 치환 (없으면 WordNet)
             - 비유의어 모드: WordNet → 없으면 다른 클러스터
         global_state: 
             전체 코퍼스 기준 치환 개수를 제어하기 위한 dict
@@ -367,22 +361,35 @@ def attack_doc(text, nlp, per_doc_percent, seed, synonym_ratio, global_state):
             for i in range(ent.start, ent.end):
                 ent_protected.add(i)
 
-    # 치환 후보 토큰 인덱스 수집
+    # [PATCH] 치환 후보 토큰 인덱스 수집 (Cluster OR WordNet 하이브리드)
     candidates = []
     for i, t in enumerate(tokens):
         if i in ent_protected:
             continue
         if not t.is_alpha:
             continue
+
+        # stopword는 그냥 스킵
         if t.text.lower() in STOP_WORDS:
-            continue
-        # 클러스터에 존재하지 않는 단어는 스킵 (클러스터 기반 통계 실험에 맞추기 위함)
-        if t.text.lower() not in TOKEN_TO_CLUSTER:
             continue
         if t.like_num:
             continue
-        if len(t.text) < 3:
+
+        # 클러스터용 정규화
+        cluster_lemma = normalize_cluster_token(t.text)
+        in_cluster = bool(cluster_lemma) and (cluster_lemma in TOKEN_TO_CLUSTER)
+
+        # WordNet 동의어가 존재하는지 미리 체크
+        wn_pos = SPACY2WN.get(t.pos_)
+        has_wn_syn = False
+        if wn_pos:
+            if wn.synsets(t.text.lower(), pos=wn_pos):
+                has_wn_syn = True
+
+        # 클러스터에도 없고 WordNet 동의어도 없으면 후보에서 제외
+        if not in_cluster and not has_wn_syn:
             continue
+
         candidates.append(i)
 
     if not candidates or doc_budget <= 0:
@@ -435,7 +442,7 @@ def attack_doc(text, nlp, per_doc_percent, seed, synonym_ratio, global_state):
                 rep_lemma = syns[idx_choice]
                 detail_mode = "cluster_syn"
             else:
-                # 같은 클러스터 유의어가 없다면 WordNet 동의어로 fallback
+                # 2순위: 클러스터 유의어가 없으면 WordNet 동의어로 fallback
                 wn_syns = get_wordnet_candidates(tok)
                 if wn_syns:
                     key = f"{tok.text.lower()}|{tok.pos_}|{seed}|wn_fallback"
@@ -443,7 +450,6 @@ def attack_doc(text, nlp, per_doc_percent, seed, synonym_ratio, global_state):
                     rep_lemma = wn_syns[idx_choice]
                     detail_mode = "wordnet_syn_fallback"
                 else:
-                    # 아무 후보도 없으면 이 토큰은 스킵
                     rep_lemma = None
                     detail_mode = "none"
         else:
@@ -456,7 +462,7 @@ def attack_doc(text, nlp, per_doc_percent, seed, synonym_ratio, global_state):
                 rep_lemma = wn_syns[idx_choice]
                 detail_mode = "wordnet_syn"
             else:
-                # 2순위: WordNet 동의어도 없으면 다른 클러스터에서 후보 선택 (cluster_other)
+                # 2순위: WordNet 동의어도 없으면, 클러스터에 있으면 다른 클러스터에서 후보 선택 (cluster_other)
                 rep_lemma = get_nonsynonym_candidate(tok.text, seed)
                 if rep_lemma is not None:
                     detail_mode = "cluster_other"
@@ -493,7 +499,7 @@ def attack_doc(text, nlp, per_doc_percent, seed, synonym_ratio, global_state):
             "orig": tok.text,
             "replacement": rep,
             "mode": "synonym" if use_synonym else "nonsynonym",
-            "detail_mode": detail_mode,  # cluster_syn / wordnet_syn / cluster_other 등
+            "detail_mode": detail_mode,  # cluster_syn / wordnet_syn / wordnet_syn_fallback / cluster_other 등
         })
 
         # 전역 치환 개수 업데이트
@@ -523,81 +529,47 @@ def _coerce_percent(x):
 # ------------------ 메인 함수 ------------------
 def main():
     parser = argparse.ArgumentParser()
-
-    # 여기서는 "모두 optional"로 두고, None이면 CONFIG를 사용
-    parser.add_argument("--input", type=str, default=None,
+    parser.add_argument("--input", type=str, required=False, default=CFG_INPUT,
                         help="입력 CSV 파일 경로 (예: dataset/clustering_wm.csv)")
-    parser.add_argument("--output", type=str, default=None,
+    parser.add_argument("--output", type=str, required=False, default=CFG_OUTPUT,
                         help="치환 결과를 저장할 CSV 파일 경로")
 
     # 문서별 치환 비율 설정
-    parser.add_argument("--per-doc-percent", type=float, default=None,
+    parser.add_argument("--per-doc-percent", type=float, default=CFG_PER_DOC_PERCENT,
                         help="모든 문서에 동일하게 적용할 치환 비율 (예: 10 → 10%)")
-    parser.add_argument("--per-doc-percent-col", type=str, default=None,
+    parser.add_argument("--per-doc-percent-col", type=str, default=CFG_PER_DOC_PERCENT_COL,
                         help="각 문서별 치환 비율이 들어있는 컬럼 이름 (0~100).")
-    parser.add_argument("--default-per-doc-percent", type=float, default=None,
+    parser.add_argument("--default-per-doc-percent", type=float, default=CFG_DEFAULT_PER_DOC_PERCENT,
                         help="per-doc-percent-col 값이 비어있거나 잘못된 경우 사용될 기본값. \
-                              지정하지 않으면 CONFIG 또는 10%%를 사용.")
+                              지정하지 않으면 --per-doc-percent 또는 10%%를 사용.")
 
     # 전체 코퍼스 기준 글로벌 치환 비율
-    parser.add_argument("--global-percent", type=float, default=None,
+    parser.add_argument("--global-percent", type=float, default=CFG_GLOBAL_PERCENT,
                         help="코퍼스 전체 알파벳 토큰의 몇 %까지만 치환할지 설정 (예: 5 → 5%).")
-    parser.add_argument("--seed", type=int, default=None,
+    parser.add_argument("--seed", type=int, default=CFG_SEED,
                         help="랜덤 시드 (재현성 확보용).")
 
     # 유의어 vs 비유의어 비율
-    parser.add_argument("--synonym-ratio", type=float, default=None,
+    parser.add_argument("--synonym-ratio", type=float, default=CFG_SYNONYM_RATIO,
                         help="치환 대상 토큰 중 몇 %를 유의어 모드로 바꿀지 (0.0~1.0). \
                               1.0 = 전부 유의어, 0.0 = 전부 비유의어(WordNet→다른 클러스터).")
 
-    # 워터마크 검출 관련 옵션
-    parser.add_argument("--model-name", type=str, default=None,
+    # [추가] 워터마크 검출 관련 옵션
+    parser.add_argument("--model-name", type=str, default=DETECT_MODEL_NAME,
                         help="Tokenizer를 불러올 HF 모델 이름 (워터마킹에 사용한 모델과 맞추는 걸 추천).")
-    parser.add_argument("--detect-gamma", type=float, default=None,
+    parser.add_argument("--detect-gamma", type=float, default=DETECT_GAMMA,
                         help="WatermarkDetector에서 사용할 gamma.")
-    parser.add_argument("--detect-delta", type=float, default=None,
+    parser.add_argument("--detect-delta", type=float, default=DETECT_DELTA,
                         help="WatermarkDetector에서 사용할 delta (사용하지 않으면 무시될 수 있음).")
-    parser.add_argument("--seeding-scheme", type=str, default=None,
+    parser.add_argument("--seeding-scheme", type=str, default=DETECT_SEEDING_SCHEME,
                         help="WatermarkDetector seeding scheme (보통 'simple_1').")
-    parser.add_argument("--z-col-name", type=str, default=None,
+    parser.add_argument("--z-col-name", type=str, default=Z_COL_NAME,
                         help="치환 후 z-score를 저장할 컬럼 이름.")
-    parser.add_argument("--device", type=str, default=None,
+    parser.add_argument("--device", type=str, default=CFG_DEVICE,
                         help="검출에 사용할 디바이스 (예: 'cuda', 'cpu'). 지정 안 하면 자동 선택.")
 
     args = parser.parse_args()
 
-    # ================= CONFIG + CLI 머지 =================
-    # CLI에서 주면 CLI 우선, 아니면 CONFIG 값 사용
-
-    args.input  = args.input  if args.input  is not None else CFG_INPUT
-    args.output = args.output if args.output is not None else CFG_OUTPUT
-
-    args.per_doc_percent      = args.per_doc_percent      if args.per_doc_percent      is not None else CFG_PER_DOC_PERCENT
-    args.per_doc_percent_col  = args.per_doc_percent_col  if args.per_doc_percent_col  is not None else CFG_PER_DOC_PERCENT_COL
-    args.default_per_doc_percent = (
-        args.default_per_doc_percent
-        if args.default_per_doc_percent is not None
-        else CFG_DEFAULT_PER_DOC_PERCENT
-    )
-
-    args.global_percent = args.global_percent if args.global_percent is not None else CFG_GLOBAL_PERCENT
-    args.seed           = args.seed           if args.seed           is not None else CFG_SEED
-    args.synonym_ratio  = args.synonym_ratio  if args.synonym_ratio  is not None else CFG_SYNONYM_RATIO
-
-    args.model_name     = args.model_name     if args.model_name     is not None else CFG_MODEL_NAME
-    args.detect_gamma   = args.detect_gamma   if args.detect_gamma   is not None else CFG_DETECT_GAMMA
-    args.detect_delta   = args.detect_delta   if args.detect_delta   is not None else CFG_DETECT_DELTA
-    args.seeding_scheme = args.seeding_scheme if args.seeding_scheme is not None else CFG_SEEDING_SCHEME
-    args.z_col_name     = args.z_col_name     if args.z_col_name     is not None else CFG_Z_COL_NAME
-    args.device         = args.device         if args.device         is not None else CFG_DEVICE
-
-    # input / output 최소 체크
-    if not args.input:
-        print("\n[FATAL ERROR] 입력 파일 경로가 설정되지 않았습니다. CFG_INPUT 또는 --input을 확인하세요.")
-        exit(1)
-    if not args.output:
-        print("\n[FATAL ERROR] 출력 파일 경로가 설정되지 않았습니다. CFG_OUTPUT 또는 --output을 확인하세요.")
-        exit(1)
 
     # fallback 퍼센트 결정
     fallback_pct = (
@@ -625,7 +597,7 @@ def main():
 
     use_col = args.per_doc_percent_col
     if use_col is None and args.per_doc_percent is None:
-        print(f"[WARN] neither per-doc-percent nor per-doc-percent-col provided; defaulting to {fallback_pct}% for all docs.")
+        print(f"[WARN] neither --per-doc-percent nor --per-doc-percent-col provided; defaulting to {fallback_pct}% for all docs.")
 
     texts = df[TEXT_COL].fillna("").tolist()
 
@@ -662,6 +634,7 @@ def main():
         new_text, num_changes, records = attack_doc(
             txt, nlp, per_doc_pct, args.seed, args.synonym_ratio, global_state
         )
+        
         attacked.append(new_text)
 
         if records:
