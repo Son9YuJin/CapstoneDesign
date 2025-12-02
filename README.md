@@ -34,9 +34,10 @@ demo_watermark.py                # 워터마크 삽입 + 검출 데모 (CSV 기�
 demo_detect.py                   # 검출 전용 데모
 pyproject.toml                   # 패키지 설정
 
+
 ---
 
-## 설치 방법
+## 설치방법
 git clone -b watermark-lib --single-branch https://github.com/Son9YuJin/CapstoneDesign.git
 cd CapstoneDesign
 python -m pip install -e .
