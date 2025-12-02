@@ -44,3 +44,15 @@ pyproject.toml                   # 패키지 설정
 git clone -b watermark-lib --single-branch https://github.com/Son9YuJin/CapstoneDesign.git
 cd CapstoneDesign
 python -m pip install -e .
+```
+
+### 2) GitHub에서 직접 설치 (코드 수정 필요 없을 때)
+
+```bash
+python -m pip install "git+https://github.com/Son9YuJin/CapstoneDesign.git@watermark-lib"
+```
+레포를 직접 클론하지 않고, llm_watermark 라이브러리만 바로 설치해서 쓰고 싶을 때 사용합니다.
+설치 후 동일하게 다음과 같이 import 할 수 있습니다.
+```bash
+from llm_watermark import WatermarkLogitsProcessor, WatermarkDetector
+```
