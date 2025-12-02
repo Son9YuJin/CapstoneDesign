@@ -34,7 +34,7 @@ src/
 demo_watermark.py                # 워터마크 삽입 + 검출 데모 (CSV 기반)
 demo_detect.py                   # 검출 전용 데모
 pyproject.toml                   # 패키지 설정
-```text
+```
 
 ## 설치 방법
 
