@@ -8,7 +8,7 @@ from torch import Tensor
 from tokenizers import Tokenizer
 from transformers import LogitsProcessor
 from nltk.util import ngrams
-from normalizers import normalization_strategy_lookup
+from .normalizers import normalization_strategy_lookup
 
 
 import numpy as np

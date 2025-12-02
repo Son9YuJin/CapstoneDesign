@@ -16,7 +16,7 @@ from transformers import (
     LogitsProcessorList,
 )
 
-from watermark_processor import WatermarkLogitsProcessor, WatermarkDetector
+from llm_watermark import WatermarkLogitsProcessor, WatermarkDetector
 
 # ========================== CONFIG ==========================
 # best parameters
@@ -29,7 +29,7 @@ OUTPUT_CSV = f"dataset/clustering_wm_gamma{BEST_GAMMA}_delta{BEST_DELTA}_cg{BEST
 MODEL_NAME = "facebook/opt-125m"
 USE_GPU = True
 MAX_NEW_TOKENS = 100
-CLUSTER_DATA_PATH = "cluster_data.npz"
+CLUSTER_DATA_PATH = "src/llm_watermark/data/cluster_data.npz"
 NUM_PROMPT_TOKENS = 100
 # ============================================================
 
