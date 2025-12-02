@@ -1,4 +1,4 @@
-# llm_watermark – LLM Text Watermarking Library (Capstone Design)
+# LLM Text Watermarking Library (Capstone Design)
 
 이 레포지토리는 대규모 언어 모델(LLM)의 **텍스트 워터마킹 삽입·검출 실험**을 위해 만들어진  
 파이썬 라이브러리 **`llm_watermark`** 와 관련 데모/실험 스크립트를 포함합니다.
@@ -33,6 +33,8 @@ src/
 demo_watermark.py                # 워터마크 삽입 + 검출 데모 (CSV 기반)
 demo_detect.py                   # 검출 전용 데모
 pyproject.toml                   # 패키지 설정
+
+---
 
 ## 설치 방법
 git clone -b watermark-lib --single-branch https://github.com/Son9YuJin/CapstoneDesign.git
