@@ -1,5 +1,4 @@
-# attack_substitute_example.py
-# 단일 텍스트 WordNet 치환 공격 + z-score 계산 + 줄바꿈 완전 지원 버전
+# 단일 텍스트 WordNet 치환 공격 + z-score 계산
 
 import re
 import math
@@ -228,10 +227,7 @@ def substitute_attack(text, per_doc_percent=10.0, seed=42):
 # ================================
 
 if __name__ == "__main__":
-    text = """ some of the biggest cable providers who currently provide content on home. and they are also using streaming to deliver their shows across multiple platforms, including smartphones, tablets and even laptops so that consumers can watch in their homes. a net-zero-energy model - by 2024. 
-In a bid to cut the waste and create jobs it is expected Netflix and Sony will be rolling out an initiative to reduce its global footprint.com to:
-- provide low and zerocarbon, low and carbon energy sources through its global membership; and to: "start, develop and distribute renewable-energy assets, including wind farms, oil wells, gas turbines and hydrographic power stations.
-- introduce solar and wind farms in 50 cities for 10 years.
+    text = """ 
 """
 
     new_text, z = substitute_attack(text, per_doc_percent=30)
