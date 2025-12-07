@@ -55,7 +55,7 @@ watermark_processor = WatermarkLogitsProcessor(
 
 # 3) 프롬프트 
 prompt = (
-    " "
+    "last star wars not for children the sixth and final star wars movie may not be suitable for young children film-maker george lucas has said. he told us tv show 60 minutes that revenge of the sith would be the darkest and most violent of the series. i don t think i would take a five or six-year-old to this he told the cbs programme to be aired on sunday. lucas predicted the film would get a us rating advising parents some scenes may be"
 )
 
 tokd_input = tokenizer(
